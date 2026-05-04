@@ -22,7 +22,7 @@ from src.state import State
 
 
 @responses.activate
-def test_full_pipeline_dry_run(cfg, tmp_path: Path):
+def test_full_pipeline_dry_run(cfg, market_meta, tmp_path: Path):
     # 1. Mock leaderboard
     responses.add(
         responses.GET,
@@ -74,7 +74,7 @@ def test_full_pipeline_dry_run(cfg, tmp_path: Path):
     positions = PositionTracker(info, cfg.account_address, state, journal)
     positions.start()
 
-    mirror = MirrorTrader(cfg, exchange, positions, journal, alerter)
+    mirror = MirrorTrader(cfg, exchange, positions, journal, alerter, market_meta)
     follower = FillFollower(info, mirror.on_leader_fill, state)
     follower.follow([t.address for t in leaders])
 
@@ -150,7 +150,7 @@ def test_full_pipeline_dry_run(cfg, tmp_path: Path):
 
 
 @responses.activate
-def test_pipeline_with_live_order_submission(cfg, tmp_path: Path):
+def test_pipeline_with_live_order_submission(cfg, market_meta, tmp_path: Path):
     cfg = replace(cfg, risk=replace(cfg.risk, dry_run=False))
     responses.add(
         responses.GET,
@@ -180,7 +180,7 @@ def test_pipeline_with_live_order_submission(cfg, tmp_path: Path):
     leaders = discover_leaders(LiquidictionClient(cfg.network.liquidiction_base), cfg.discovery)
     positions = PositionTracker(info, cfg.account_address, state, journal)
     positions.start()
-    mirror = MirrorTrader(cfg, exchange, positions, journal, NullAlerter())
+    mirror = MirrorTrader(cfg, exchange, positions, journal, NullAlerter(), market_meta)
     follower = FillFollower(info, mirror.on_leader_fill, state)
     follower.follow([t.address for t in leaders])
 

@@ -1,5 +1,7 @@
+import argparse
 import logging
 import signal
+import sys
 import threading
 import time
 
@@ -7,23 +9,57 @@ from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 
-from .alerts import NullAlerter, WebhookAlerter
-from .config import load_config
+from .alerts import Alerter, NullAlerter, WebhookAlerter
+from .config import Config, load_config
 from .connection import ConnectionHealth
+from .errors import PreflightError
 from .follower import FillFollower
 from .journal import Journal
 from .leaders import discover_leaders
 from .liquidiction import LiquidictionClient
 from .log import setup_logging
+from .market_meta import MarketMeta
 from .mirror import MirrorTrader
 from .positions import PositionTracker
+from .preflight import format_report, run_preflight
 from .state import State
 
 log = logging.getLogger(__name__)
 
 
-def main() -> None:
-    cfg = load_config("config.yaml")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="hyper-trader", description="HIP-4 copy-trading bot.")
+    p.add_argument(
+        "--config", default="config.yaml", help="path to config YAML (default: config.yaml)"
+    )
+    p.add_argument("--preflight", action="store_true", help="run preflight checks and exit")
+    p.add_argument(
+        "--skip-preflight", action="store_true", help="skip preflight gate (not recommended)"
+    )
+    return p.parse_args(argv)
+
+
+def build_alerter(cfg: Config) -> Alerter:
+    if cfg.webhook_url:
+        return WebhookAlerter(cfg.webhook_url, min_level=cfg.ops.alert_min_level)
+    return NullAlerter()
+
+
+def install_signal_handler() -> threading.Event:
+    stop = threading.Event()
+
+    def handler(signum: int, _frame: object) -> None:
+        log.info("Received signal %d; initiating shutdown", signum)
+        stop.set()
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    return stop
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    cfg = load_config(args.config)
     setup_logging(level=cfg.ops.log_level, json_mode=cfg.ops.log_json)
 
     log.info(
@@ -33,19 +69,45 @@ def main() -> None:
         cfg.account_address,
     )
 
+    info = Info(cfg.hyperliquid_api_url, skip_ws=bool(args.preflight))
+
+    # Preflight gate (always runs unless explicitly skipped)
+    if not args.skip_preflight or args.preflight:
+        report = run_preflight(info, cfg.account_address)
+        print(format_report(report))
+        if args.preflight:
+            return 0 if report.healthy else 1
+        if not report.healthy:
+            log.error("Preflight unhealthy; aborting startup. Use --skip-preflight to bypass.")
+            raise PreflightError("preflight failed; see report above")
+
+    market_meta = MarketMeta(info)
+    market_meta.load()
+
     state = State(cfg.ops.state_db)
     journal = Journal(cfg.ops.journal_path)
-    alerter = (
-        WebhookAlerter(cfg.webhook_url, min_level=cfg.ops.alert_min_level)
-        if cfg.webhook_url
-        else NullAlerter()
-    )
+    alerter = build_alerter(cfg)
 
     wallet = Account.from_key(cfg.private_key)
-    info = Info(cfg.hyperliquid_api_url, skip_ws=False)
     exchange = Exchange(wallet, cfg.hyperliquid_api_url, account_address=cfg.account_address)
 
-    health = ConnectionHealth(alerter, stale_threshold_s=cfg.ops.ws_stale_threshold_s)
+    # Backfill closure — wired into ConnectionHealth so a stale WS triggers a REST sweep
+    follower_holder: dict[str, FillFollower] = {}
+
+    def on_stale() -> None:
+        f = follower_holder.get("f")
+        if f is None:
+            return
+        try:
+            f.backfill()
+        except Exception:
+            log.exception("Backfill on stale failed")
+
+    health = ConnectionHealth(
+        alerter,
+        stale_threshold_s=cfg.ops.ws_stale_threshold_s,
+        on_stale=on_stale,
+    )
     health.start()
 
     positions = PositionTracker(info, cfg.account_address, state, journal, health)
@@ -57,7 +119,7 @@ def main() -> None:
         log.error("No leaders matched filters; aborting.")
         journal.write("startup_aborted", reason="no_leaders")
         health.stop()
-        return
+        return 1
 
     journal.write(
         "startup",
@@ -71,11 +133,12 @@ def main() -> None:
         f"dry_run={cfg.risk.dry_run} leaders={len(leaders)}",
     )
 
-    mirror = MirrorTrader(cfg, exchange, positions, journal, alerter)
+    mirror = MirrorTrader(cfg, exchange, positions, journal, alerter, market_meta)
     follower = FillFollower(info, mirror.on_leader_fill, state, health)
     follower.follow([t.address for t in leaders])
+    follower_holder["f"] = follower
 
-    stop = _install_signal_handler()
+    stop = install_signal_handler()
     last_refresh = time.time()
     log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
     try:
@@ -101,19 +164,8 @@ def main() -> None:
         journal.write("shutdown")
         alerter.alert("info", "hyper-trader stopping")
         health.stop()
-
-
-def _install_signal_handler() -> threading.Event:
-    stop = threading.Event()
-
-    def handler(signum: int, _frame: object) -> None:
-        log.info("Received signal %d; initiating shutdown", signum)
-        stop.set()
-
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
-    return stop
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

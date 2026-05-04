@@ -6,6 +6,7 @@ from typing import Any
 
 from .connection import ConnectionHealth
 from .journal import Journal
+from .protocols import InfoProto
 from .state import State
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class PositionTracker:
 
     def __init__(
         self,
-        info: Any,
+        info: InfoProto,
         account_address: str,
         state: State,
         journal: Journal,

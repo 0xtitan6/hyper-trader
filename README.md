@@ -28,6 +28,9 @@ Every leader fill, intent, risk decision, and order outcome is appended to a JSO
 - **Real-time mirroring** via `userFills` websocket subscriptions; deduped by `tid` in sqlite so restarts don't replay.
 - **Own-fill tracking** maintains realized PnL and position book — wires the daily-loss kill switch.
 - **Risk rails**: kill switch file, max exposure (cost-basis), max daily loss, max/min per-trade size, allowed market types.
+- **Preflight gate** (`--preflight` or auto on startup): probes HL `meta`, `spotMeta`, `outcomeMeta`, `user_state`, `user_fills`, validates fill schema against required fields, lists active HIP-4 outcomes, refuses startup on failure.
+- **Tick/lot rounding** via cached `MarketMeta` — sizes rounded to per-coin `szDecimals`, prices to 5 sig figs (HL rule). Outcomes default to integer shares.
+- **WS staleness backfill**: when no messages arrive within `ws_stale_threshold_s`, alerts fire AND a REST sweep via `userFillsByTime` catches missed fills (deduped through state).
 - **Network mismatch refusal**: bot refuses to start if `HL_NETWORK` env doesn't match `network.hyperliquid_env` in YAML.
 - **WS health monitor** with stale-connection alerts.
 - **Webhook alerts** (Slack/Discord-compatible) for: kill switch trips, daily loss cap, exposure cap, WS staleness, order failures, pipeline exceptions.
@@ -71,8 +74,9 @@ Get test funds at https://app.hyperliquid-testnet.xyz/drip. Requires a prior mai
 ### 4. Run
 
 ```bash
-just run
-# or: .venv/bin/python -m src.main
+just run                                 # full bot (runs preflight first, then trades)
+.venv/bin/python -m src.main --preflight # preflight only — verify connectivity, schema, outcomes
+.venv/bin/python -m src.main --skip-preflight  # bypass preflight gate (not recommended)
 ```
 
 In dry-run mode, logs show intended trades but never submit:
@@ -123,9 +127,10 @@ Test layout:
 ## Limits and known gaps
 
 - **WS user-sub cap**: Hyperliquid allows max 10 unique users per IP for `userFills` subs — `discovery.top_n` is capped at 10 by `load_config`.
-- **HIP-4 in the typed SDK**: outcome markets aren't formally exposed; the bot uses the `coin` string from the leader's fill (e.g. `#11`). The SDK's `Exchange.order()` works through this. Verify on testnet before any mainnet use.
+- **HIP-4 in the typed SDK**: outcome markets aren't formally exposed; the bot uses the `coin` string (e.g. `#11`) which the SDK's `Exchange.order()` accepts. Fill schema and `outcomeMeta` endpoint were validated against the live mainnet API; coin notation `#10` (Yes), `#11` (No) confirmed.
 - **Exposure is cost-basis, not mark-to-market**: for fully-collateralized HIP-4 outcomes that's the actual max loss; for perps it under-counts what a liquidation could cost.
 - **No backtest harness** in v1 — testnet is the validation environment.
+- **No order idempotency via `cloid`**: a crash between submit and journal-write means restart-time reconciliation isn't possible. Fine for low-frequency outcome trading; would matter for HFT.
 
 ## File layout
 

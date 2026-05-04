@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,6 +13,7 @@ from src.config import (
     SizingConfig,
 )
 from src.journal import Journal
+from src.market_meta import MarketMeta
 from src.state import State
 
 
@@ -70,6 +72,28 @@ def cfg(tmp_path: Path) -> Config:
         account_address="0x" + "a" * 40,
         webhook_url="",
     )
+
+
+@pytest.fixture
+def market_meta() -> MarketMeta:
+    """A loaded MarketMeta with sane test defaults — no real HTTP calls."""
+    info = MagicMock()
+    info.meta.return_value = {
+        "universe": [
+            {"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
+            {"name": "ETH", "szDecimals": 4, "maxLeverage": 50},
+        ]
+    }
+    info.spot_meta.return_value = {
+        "universe": [{"name": "PURR/USDC", "tokens": [1, 0], "index": 0}],
+        "tokens": [
+            {"name": "USDC", "szDecimals": 8, "index": 0},
+            {"name": "PURR", "szDecimals": 0, "index": 1},
+        ],
+    }
+    mm = MarketMeta(info)
+    mm.load()
+    return mm
 
 
 @pytest.fixture

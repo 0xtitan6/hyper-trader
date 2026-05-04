@@ -1,12 +1,14 @@
 import logging
 import os
 from dataclasses import asdict, dataclass
-from typing import Any
 
 from .alerts import Alerter
 from .config import Config
+from .errors import OrderError
 from .journal import Journal
+from .market_meta import MarketMeta
 from .positions import PositionTracker
+from .protocols import ExchangeProto
 
 log = logging.getLogger(__name__)
 
@@ -24,16 +26,18 @@ class MirrorTrader:
     def __init__(
         self,
         cfg: Config,
-        exchange: Any,
+        exchange: ExchangeProto,
         positions: PositionTracker,
         journal: Journal,
         alerter: Alerter,
+        market_meta: MarketMeta,
     ):
         self.cfg = cfg
         self.exchange = exchange
         self.positions = positions
         self.journal = journal
         self.alerter = alerter
+        self.market_meta = market_meta
 
     def on_leader_fill(self, leader: str, fill: dict) -> None:
         tid = fill.get("tid")
@@ -64,6 +68,9 @@ class MirrorTrader:
                 log.info("[risk] reject (%s) leader=%s coin=%s", reason, leader[:10], intent.coin)
                 return
             self._submit(intent, leader, tid)
+        except OrderError:
+            # already journaled + alerted in _submit; don't double-log as pipeline error
+            raise
         except Exception:
             log.exception("Mirror pipeline error leader=%s tid=%s", leader, tid)
             self.alerter.alert(
@@ -99,12 +106,18 @@ class MirrorTrader:
         if mirror_notional < s.min_per_trade_usd:
             return None
 
+        raw_sz = mirror_notional / px
+        rounded_sz = self.market_meta.round_size(coin, raw_sz)
+        if rounded_sz <= 0:
+            # rounding to integer/lot took us to zero — leader's trade is too small to mirror
+            return None
+        rounded_px = self.market_meta.round_price(px)
         return TradeIntent(
             coin=coin,
             is_buy=is_buy,
-            sz=mirror_notional / px,
-            limit_px=px,
-            notional_usd=mirror_notional,
+            sz=rounded_sz,
+            limit_px=rounded_px,
+            notional_usd=rounded_sz * rounded_px,
         )
 
     def _is_allowed_market(self, coin: str) -> bool:
@@ -153,7 +166,8 @@ class MirrorTrader:
             return
 
         slip = 0.005
-        px = intent.limit_px * (1 + slip if intent.is_buy else 1 - slip)
+        slipped_px = intent.limit_px * (1 + slip if intent.is_buy else 1 - slip)
+        px = self.market_meta.round_price(slipped_px)
         log.info(
             "Submitting %s %s %.6f @ %.4f notional=$%.2f",
             "BUY" if intent.is_buy else "SELL",
@@ -179,7 +193,7 @@ class MirrorTrader:
                 intent=asdict(intent),
                 error=str(e),
             )
-            raise
+            raise OrderError(f"order failed: {e}") from e
         log.info("Order result: %s", result)
         self.journal.write(
             "order_result",
