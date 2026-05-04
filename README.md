@@ -98,7 +98,9 @@ just fmt              # auto-fix lint and reformat
 just typecheck        # mypy
 ```
 
-Current state: **100 tests, 83% coverage** (94–100% on all business logic; `main.py` entry-point wiring is uncovered by unit tests by design).
+Current state: **142 tests, 88% coverage** (94–100% on every business module; strict mypy clean; ruff clean). `main.py` integration wiring (36% covered by helpers) runs an infinite loop and is exercised end-to-end at runtime rather than by unit tests.
+
+Pre-commit hooks (`.pre-commit-config.yaml`) run ruff lint + format, mypy, and security checks (`detect-private-key`, `check-merge-conflict`, etc.) on every commit.
 
 Test layout:
 
@@ -112,8 +114,13 @@ Test layout:
 | `tests/test_alerts.py` | Webhook level filtering, post-failure swallowed, disabled-when-empty |
 | `tests/test_connection.py` | Stale alert fires once, recovery alert, threshold validation |
 | `tests/test_positions.py` | Long/short open/close/flip, avg-px math, dedupe, malformed fill handling, exposure |
-| `tests/test_follower.py` | Subscription dedupe, snapshot vs live fills, dedupe across messages, callback exception isolation |
-| `tests/test_mirror.py` | Sizing modes, market-type allowlist, every risk-check rejection path, slippage application, order-failure alerting |
+| `tests/test_position_properties.py` | **Hypothesis property tests** — full-close zeros position, weighted-avg between bounds, signed-size sum invariant, idempotent dedupe, non-negative avg |
+| `tests/test_follower.py` | Subscription dedupe, snapshot vs live fills, dedupe across messages, REST `backfill()` correctness, RPC failure handling |
+| `tests/test_market_meta.py` | Per-coin `szDecimals` lookup, outcome integer rounding, 5-sig-fig price rule, load idempotency, upstream-failure error mapping |
+| `tests/test_preflight.py` | Healthy/unhealthy reports, schema validation against required fields, error path per endpoint |
+| `tests/test_log.py` | Plain vs JSON formatter, exception inclusion, idempotent setup |
+| `tests/test_main.py` | Argparse defaults & flags, alerter selection, signal handler |
+| `tests/test_mirror.py` | Sizing modes, market-type allowlist, every risk-check rejection path, slippage + tick rounding, order-failure alerting & propagation |
 | `tests/test_integration.py` | End-to-end: discovery → subscribe → mirror, both dry-run and live |
 
 ## Safety
@@ -136,15 +143,19 @@ Test layout:
 
 | Path | Purpose |
 |---|---|
-| `src/main.py` | Entrypoint, signal handling, leader-refresh loop |
-| `src/config.py` | YAML + env loading, schema validation |
-| `src/state.py` | Sqlite persistence (dedupe tids, own fills, positions) |
+| `src/main.py` | Entrypoint, argparse CLI (`--preflight`, `--skip-preflight`, `--config`), signal handling, leader-refresh loop |
+| `src/config.py` | YAML + env loading, schema validation, immutable dataclasses |
+| `src/state.py` | Sqlite persistence (dedupe tids, own fills, positions, daily PnL) |
 | `src/journal.py` | Append-only JSONL trade journal |
 | `src/liquidiction.py` | Liquidiction leaderboard HTTP client |
 | `src/leaders.py` | Filter candidates → leader set |
-| `src/follower.py` | Subscribe to leader fills, dedupe, dispatch |
-| `src/positions.py` | Subscribe to own fills, realized PnL, position book |
-| `src/mirror.py` | Sizing, risk checks, order submission, journaling |
-| `src/connection.py` | WS staleness monitor + alerts |
-| `src/alerts.py` | Webhook alerter + null alerter |
+| `src/follower.py` | Subscribe to leader fills, dedupe, dispatch, REST backfill |
+| `src/positions.py` | Subscribe to own fills, realized PnL, position book, exposure |
+| `src/mirror.py` | Sizing, risk checks, tick/lot rounding, order submission, journaling |
+| `src/preflight.py` | HL connectivity probe + fill-schema validation + outcome listing |
+| `src/market_meta.py` | Cached perp/spot `szDecimals` and 5-sig-fig price rounding |
+| `src/connection.py` | WS staleness monitor + alerts + `on_stale` backfill hook |
+| `src/alerts.py` | Webhook alerter + null alerter (level filtering, best-effort) |
 | `src/log.py` | Plain or JSON logging setup |
+| `src/protocols.py` | `InfoProto` and `ExchangeProto` Protocol types for HL SDK |
+| `src/errors.py` | Custom exception hierarchy (`HyperTraderError` and subclasses) |
