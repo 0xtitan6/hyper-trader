@@ -11,6 +11,8 @@ def positions():
     p = MagicMock()
     p.realized_pnl_today.return_value = 0.0
     p.total_exposure_usd.return_value = 0.0
+    # Default: no existing position → reduce_only stays False
+    p.state.get_position.return_value = (0.0, 0.0)
     return p
 
 
@@ -47,6 +49,7 @@ def test_happy_path_live_submits(
     # IOC slippage: 0.5%
     assert px > float(outcome_fill["px"])  # buy side adds slippage
     assert kwargs["order_type"] == {"limit": {"tif": "Ioc"}}
+    assert kwargs["reduce_only"] is False  # no opposing position → not reduce_only
 
 
 def test_sell_path_subtracts_slippage(
@@ -199,3 +202,116 @@ def _override_sizing(cfg, **changes):
 def test_intent_dataclass_basic():
     i = TradeIntent(coin="#11", is_buy=True, sz=10.0, limit_px=0.5, notional_usd=5.0)
     assert i.coin == "#11" and i.is_buy is True
+    assert i.reduce_only is False  # default
+
+
+def test_configurable_slippage_50bps(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    cfg2 = _override_sizing(cfg, ioc_slippage_bps=50)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    px = exchange.order.call_args.args[3]
+    leader_px = float(outcome_fill["px"])
+    # 0.5% above leader px, then 5-sig-fig rounding
+    expected = market_meta.round_price(leader_px * 1.005)
+    assert abs(px - expected) < 1e-9
+
+
+def test_configurable_slippage_zero(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    cfg2 = _override_sizing(cfg, ioc_slippage_bps=0)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    px = exchange.order.call_args.args[3]
+    leader_px = float(outcome_fill["px"])
+    # zero slippage → submitted px equals (rounded) leader px
+    assert abs(px - market_meta.round_price(leader_px)) < 1e-9
+
+
+def test_reduce_only_on_opposing_sell_into_long(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    # Existing long 50; leader sells (opposing) ≤ 50 → reduce_only
+    positions.state.get_position.return_value = (50.0, 0.5)
+    cfg2 = _override_risk(cfg, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    fill = {**outcome_fill, "side": "A"}  # SELL
+    mt.on_leader_fill("0xleader", fill)
+    kwargs = exchange.order.call_args.kwargs
+    assert kwargs["reduce_only"] is True
+
+
+def test_reduce_only_on_opposing_buy_into_short(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    positions.state.get_position.return_value = (-50.0, 0.5)  # short
+    cfg2 = _override_risk(cfg, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # outcome_fill is BUY, opposing the short → reduce_only
+    mt.on_leader_fill("0xleader", outcome_fill)
+    kwargs = exchange.order.call_args.kwargs
+    assert kwargs["reduce_only"] is True
+
+
+def test_no_reduce_only_when_no_position(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    positions.state.get_position.return_value = (0.0, 0.0)
+    cfg2 = _override_risk(cfg, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    kwargs = exchange.order.call_args.kwargs
+    assert kwargs["reduce_only"] is False
+
+
+def test_no_reduce_only_when_flips_through_zero(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    # Existing long 5; leader sells 10 → would flip to short 5. HL rejects
+    # reduce_only flips, so we must submit reduce_only=False.
+    positions = MagicMock()
+    positions.realized_pnl_today.return_value = 0.0
+    positions.total_exposure_usd.return_value = 0.0
+    positions.state.get_position.return_value = (5.0, 0.5)
+    cfg2 = _override_risk(cfg, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # leader fill: SELL 100 @ 0.50 → 50 leader notional x 0.10 = $5 mirror = 10 size
+    fill = {"tid": 7, "coin": "#11", "px": "0.50", "sz": "100", "side": "A"}
+    mt.on_leader_fill("0xleader", fill)
+    kwargs = exchange.order.call_args.kwargs
+    assert kwargs["reduce_only"] is False  # 10 > existing 5 → flip → not reduce_only
+
+
+def test_reduce_only_bypasses_exposure_cap(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    # Already at exposure cap — a normal order would be rejected, but a
+    # reduce_only order shrinks exposure so it must go through.
+    positions.state.get_position.return_value = (50.0, 0.5)
+    positions.total_exposure_usd.return_value = 1_000_000.0  # way over cap
+    cfg2 = _override_risk(cfg, dry_run=False, max_total_exposure_usd=100)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    fill = {**outcome_fill, "side": "A"}  # opposing sell-into-long
+    mt.on_leader_fill("0xleader", fill)
+    exchange.order.assert_called_once()
+    assert exchange.order.call_args.kwargs["reduce_only"] is True
+
+
+def test_post_round_min_skip(cfg, positions, journal, alerter, exchange, market_meta):
+    # Outcome rounds to integer shares. raw_sz = 5.5 / 0.5 = 11; rounded = 11; OK.
+    # But a price=$1, notional=$5.5, raw_sz=5.5, rounded to 5, post-round notional=5
+    # which is exactly at min ($5). Use a fill that produces $4.99 post-round.
+    cfg2 = _override_sizing(cfg, min_per_trade_usd=10, max_per_trade_usd=100)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # leader fill: 100 @ 1.05 → notional 105 x 0.10 = $10.50 → raw_sz 10.0
+    # rounded to 10 (already integer), notional = 10 x 1.05 = $10.50 — passes
+    # let's craft one that fails: 95 @ 1.05 → 99.75 x 0.10 = 9.975, raw_sz=9.5
+    # → rounded 9, notional = 9 x 1.05 = 9.45 < 10 min → skip
+    fill = {"tid": 9, "coin": "#11", "px": "1.05", "sz": "95", "side": "B"}
+    mt.on_leader_fill("0xleader", fill)
+    exchange.order.assert_not_called()

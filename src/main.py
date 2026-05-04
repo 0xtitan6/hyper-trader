@@ -164,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         journal.write("shutdown")
         alerter.alert("info", "hyper-trader stopping")
         health.stop()
+        alerter.stop()
     return 0
 
 

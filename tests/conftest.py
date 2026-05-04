@@ -49,6 +49,7 @@ def cfg(tmp_path: Path) -> Config:
             fixed_usd=25.0,
             max_per_trade_usd=100.0,
             min_per_trade_usd=5.0,
+            ioc_slippage_bps=50.0,
         ),
         risk=RiskConfig(
             dry_run=True,

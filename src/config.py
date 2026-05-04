@@ -23,6 +23,7 @@ class SizingConfig:
     fixed_usd: float
     max_per_trade_usd: float
     min_per_trade_usd: float
+    ioc_slippage_bps: float = 50.0  # 0.5% default
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,10 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
         raise SystemExit(f"sizing.mode must be 'proportional' or 'fixed', got {sizing.mode!r}")
     if sizing.min_per_trade_usd > sizing.max_per_trade_usd:
         raise SystemExit("sizing.min_per_trade_usd > max_per_trade_usd")
+    if not (0 <= sizing.ioc_slippage_bps <= 1000):
+        raise SystemExit(
+            f"sizing.ioc_slippage_bps must be in [0, 1000] bps, got {sizing.ioc_slippage_bps}"
+        )
 
     risk = RiskConfig(**raw["risk"])
     valid_markets = {"outcome", "perp", "spot"}
@@ -123,8 +128,11 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
         raise SystemExit("risk.allowed_market_types must list at least one market type")
 
     discovery = DiscoveryConfig(**raw["discovery"])
-    if discovery.top_n < 1 or discovery.top_n > 10:
-        raise SystemExit("discovery.top_n must be in [1, 10] (Hyperliquid WS sub cap)")
+    if discovery.top_n < 1 or discovery.top_n > 9:
+        raise SystemExit(
+            "discovery.top_n must be in [1, 9] — own userFills sub takes 1 of "
+            "Hyperliquid's 10 unique-user subs per IP."
+        )
     if discovery.period not in {"24h", "7d", "30d", "all"}:
         raise SystemExit(
             f"discovery.period must be one of 24h|7d|30d|all, got {discovery.period!r}"

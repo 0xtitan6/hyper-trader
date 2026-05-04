@@ -51,6 +51,12 @@ class PositionTracker:
         self._subscribed = True
 
     def realized_pnl_today(self) -> float:
+        """Net of fees: closedPnl - fee. This is what the daily-loss kill switch checks."""
+        gross, fee = self.state.daily_pnl(today_utc())
+        return gross - fee
+
+    def realized_pnl_today_gross(self) -> float:
+        """Gross PnL only, no fees deducted. Useful for journaling / debugging."""
         return self.state.daily_pnl(today_utc())[0]
 
     def total_exposure_usd(self) -> float:

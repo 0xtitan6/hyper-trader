@@ -17,6 +17,7 @@ dev = [
     "pytest-mock>=3.12",
     "freezegun>=1.4",
     "responses>=0.25",
+    "hypothesis>=6.100",
     "ruff>=0.4",
     "mypy>=1.10",
     "types-PyYAML",

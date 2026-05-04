@@ -148,10 +148,18 @@ def test_empty_market_types(tmp_path, good_env):
 
 
 def test_top_n_too_high(tmp_path, good_env):
+    # 10 used to be allowed; now refused because own-fill sub takes 1 of HL's 10/IP cap
     raw = _base_yaml()
-    raw["discovery"]["top_n"] = 11
+    raw["discovery"]["top_n"] = 10
     with pytest.raises(SystemExit, match="top_n"):
         load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_top_n_at_cap_ok(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["top_n"] = 9
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.discovery.top_n == 9
 
 
 def test_top_n_zero(tmp_path, good_env):
@@ -159,6 +167,27 @@ def test_top_n_zero(tmp_path, good_env):
     raw["discovery"]["top_n"] = 0
     with pytest.raises(SystemExit, match="top_n"):
         load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_invalid_ioc_slippage_bps(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["sizing"]["ioc_slippage_bps"] = 1500  # > 1000
+    with pytest.raises(SystemExit, match="ioc_slippage_bps"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_negative_ioc_slippage_bps(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["sizing"]["ioc_slippage_bps"] = -1
+    with pytest.raises(SystemExit, match="ioc_slippage_bps"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_ioc_slippage_bps_default(tmp_path, good_env):
+    raw = _base_yaml()
+    # not setting ioc_slippage_bps — should default to 50
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.sizing.ioc_slippage_bps == 50.0
 
 
 def test_invalid_period(tmp_path, good_env):

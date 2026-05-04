@@ -158,6 +158,55 @@ def test_backfill_default_since_ms(state: State):
     assert isinstance(payload["startTime"], int)
 
 
+def test_snapshot_bad_tid_does_not_abort_batch(state: State):
+    """A non-numeric tid in the snapshot batch must not stop later good tids
+    from being marked seen — otherwise they would replay as 'new' on the next
+    live message and trigger duplicate orders."""
+    info, captured = _info_capturing_subscribe()
+    f = FillFollower(info, MagicMock(), state)
+    f.follow(["0xabc"])
+    handler = captured["cbs"][0]  # type: ignore[index]
+    handler(
+        {
+            "data": {
+                "isSnapshot": True,
+                "fills": [
+                    {"tid": "garbage"},
+                    {"tid": 5},
+                    {"tid": 6},
+                ],
+            }
+        }
+    )
+    # tids 5 and 6 should still be marked seen
+    assert state.is_tid_seen(5)
+    assert state.is_tid_seen(6)
+
+
+def test_live_bad_tid_does_not_abort_batch(state: State):
+    info, captured = _info_capturing_subscribe()
+    cb = MagicMock()
+    f = FillFollower(info, cb, state)
+    f.follow(["0xabc"])
+    handler = captured["cbs"][0]  # type: ignore[index]
+    handler(
+        {
+            "data": {
+                "isSnapshot": False,
+                "fills": [
+                    {"tid": "garbage", "coin": "#11"},
+                    {"tid": 7, "coin": "#11"},
+                    {"tid": 8, "coin": "#11"},
+                ],
+            }
+        }
+    )
+    # Good tids still dispatched
+    assert cb.call_count == 2
+    forwarded_tids = sorted(c.args[1]["tid"] for c in cb.call_args_list)
+    assert forwarded_tids == [7, 8]
+
+
 def test_callback_exception_does_not_propagate(state: State):
     info, captured = _info_capturing_subscribe()
     cb = MagicMock(side_effect=RuntimeError("boom"))

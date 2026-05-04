@@ -216,3 +216,4 @@ def test_pipeline_with_live_order_submission(cfg, market_meta, tmp_path: Path):
     # leader notional = 50; mirror notional = 5; sz = 5 / 0.5 = 10
     assert abs(args[2] - 10.0) < 1e-9
     assert kwargs["order_type"] == {"limit": {"tif": "Ioc"}}
+    assert kwargs["reduce_only"] is False  # no opposing position

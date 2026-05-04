@@ -1,6 +1,7 @@
 import logging
 import os
 from dataclasses import asdict, dataclass
+from threading import Lock
 
 from .alerts import Alerter
 from .config import Config
@@ -20,6 +21,7 @@ class TradeIntent:
     sz: float
     limit_px: float
     notional_usd: float
+    reduce_only: bool = False
 
 
 class MirrorTrader:
@@ -38,6 +40,9 @@ class MirrorTrader:
         self.journal = journal
         self.alerter = alerter
         self.market_meta = market_meta
+        # Held across risk-check + submit so two concurrent leader fills can't
+        # both pass the exposure cap based on stale state.
+        self._submit_lock = Lock()
 
     def on_leader_fill(self, leader: str, fill: dict) -> None:
         tid = fill.get("tid")
@@ -55,21 +60,23 @@ class MirrorTrader:
             if intent is None:
                 self.journal.write("intent_skipped", leader=leader, tid=tid, reason="filter")
                 return
-            ok, reason = self._risk_check(intent)
-            self.journal.write(
-                "risk_check",
-                leader=leader,
-                tid=tid,
-                ok=ok,
-                reason=reason,
-                intent=asdict(intent),
-            )
-            if not ok:
-                log.info("[risk] reject (%s) leader=%s coin=%s", reason, leader[:10], intent.coin)
-                return
-            self._submit(intent, leader, tid)
+            with self._submit_lock:
+                ok, reason = self._risk_check(intent)
+                self.journal.write(
+                    "risk_check",
+                    leader=leader,
+                    tid=tid,
+                    ok=ok,
+                    reason=reason,
+                    intent=asdict(intent),
+                )
+                if not ok:
+                    log.info(
+                        "[risk] reject (%s) leader=%s coin=%s", reason, leader[:10], intent.coin
+                    )
+                    return
+                self._submit(intent, leader, tid)
         except OrderError:
-            # already journaled + alerted in _submit; don't double-log as pipeline error
             raise
         except Exception:
             log.exception("Mirror pipeline error leader=%s tid=%s", leader, tid)
@@ -109,16 +116,36 @@ class MirrorTrader:
         raw_sz = mirror_notional / px
         rounded_sz = self.market_meta.round_size(coin, raw_sz)
         if rounded_sz <= 0:
-            # rounding to integer/lot took us to zero — leader's trade is too small to mirror
             return None
         rounded_px = self.market_meta.round_price(px)
+        rounded_notional = rounded_sz * rounded_px
+        # Re-check min after rounding — szDecimals=0 outcomes can drop us below
+        # the floor even though the raw notional was above it.
+        if rounded_notional < s.min_per_trade_usd:
+            return None
+
+        reduce_only = self._is_reduce_only(coin, is_buy, rounded_sz)
         return TradeIntent(
             coin=coin,
             is_buy=is_buy,
             sz=rounded_sz,
             limit_px=rounded_px,
-            notional_usd=rounded_sz * rounded_px,
+            notional_usd=rounded_notional,
+            reduce_only=reduce_only,
         )
+
+    def _is_reduce_only(self, coin: str, is_buy: bool, sz: float) -> bool:
+        """True iff this order strictly shrinks an existing opposing position
+        without flipping through zero. HL rejects reduce-only orders that flip.
+        """
+        existing_sz, _ = self.positions.state.get_position(coin)
+        if existing_sz == 0:
+            return False
+        # Long position + sell, or short position + buy → reducing
+        opposing = (existing_sz > 0 and not is_buy) or (existing_sz < 0 and is_buy)
+        if not opposing:
+            return False
+        return sz <= abs(existing_sz)
 
     def _is_allowed_market(self, coin: str) -> bool:
         allowed = self.cfg.risk.allowed_market_types
@@ -137,10 +164,14 @@ class MirrorTrader:
             self.alerter.alert("warn", f"Kill switch active: {r.kill_switch_file}")
             return False, "kill_switch"
 
-        realized = self.positions.realized_pnl_today()
-        if -realized >= r.max_daily_loss_usd:
-            self.alerter.alert("critical", f"Daily loss cap hit: realized=${realized:.2f}")
-            return False, f"daily_loss_cap (realized={realized:.2f})"
+        net_realized = self.positions.realized_pnl_today()
+        if -net_realized >= r.max_daily_loss_usd:
+            self.alerter.alert("critical", f"Daily loss cap hit: net=${net_realized:.2f}")
+            return False, f"daily_loss_cap (net={net_realized:.2f})"
+
+        # Reduce-only orders shrink, never grow exposure — bypass the cap.
+        if intent.reduce_only:
+            return True, ""
 
         exposure = self.positions.total_exposure_usd()
         if exposure + intent.notional_usd > r.max_total_exposure_usd:
@@ -153,28 +184,30 @@ class MirrorTrader:
     def _submit(self, intent: TradeIntent, leader: str, tid: object) -> None:
         if self.cfg.risk.dry_run:
             log.info(
-                "[DRY] %s %s %.6f @ %.4f notional=$%.2f leader=%s tid=%s",
+                "[DRY] %s %s %.6f @ %.4f notional=$%.2f reduce_only=%s leader=%s tid=%s",
                 "BUY" if intent.is_buy else "SELL",
                 intent.coin,
                 intent.sz,
                 intent.limit_px,
                 intent.notional_usd,
+                intent.reduce_only,
                 leader[:10],
                 tid,
             )
             self.journal.write("order_dry_run", leader=leader, tid=tid, intent=asdict(intent))
             return
 
-        slip = 0.005
+        slip = self.cfg.sizing.ioc_slippage_bps / 10_000.0
         slipped_px = intent.limit_px * (1 + slip if intent.is_buy else 1 - slip)
         px = self.market_meta.round_price(slipped_px)
         log.info(
-            "Submitting %s %s %.6f @ %.4f notional=$%.2f",
+            "Submitting %s %s %.6f @ %.4f notional=$%.2f reduce_only=%s",
             "BUY" if intent.is_buy else "SELL",
             intent.coin,
             intent.sz,
             px,
             intent.notional_usd,
+            intent.reduce_only,
         )
         try:
             result = self.exchange.order(
@@ -183,6 +216,7 @@ class MirrorTrader:
                 intent.sz,
                 px,
                 order_type={"limit": {"tif": "Ioc"}},
+                reduce_only=intent.reduce_only,
             )
         except Exception as e:
             self.alerter.alert("error", f"Order submit failed: {type(e).__name__}: {e}")

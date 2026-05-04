@@ -29,8 +29,12 @@ Every leader fill, intent, risk decision, and order outcome is appended to a JSO
 - **Own-fill tracking** maintains realized PnL and position book — wires the daily-loss kill switch.
 - **Risk rails**: kill switch file, max exposure (cost-basis), max daily loss, max/min per-trade size, allowed market types.
 - **Preflight gate** (`--preflight` or auto on startup): probes HL `meta`, `spotMeta`, `outcomeMeta`, `user_state`, `user_fills`, validates fill schema against required fields, lists active HIP-4 outcomes, refuses startup on failure.
-- **Tick/lot rounding** via cached `MarketMeta` — sizes rounded to per-coin `szDecimals`, prices to 5 sig figs (HL rule). Outcomes default to integer shares.
+- **Tick/lot rounding** via cached `MarketMeta` — sizes rounded to per-coin `szDecimals`, prices to 5 sig figs (HL rule). Outcomes default to integer shares. `min_per_trade_usd` re-checked *after* rounding so sub-lot trades aren't submitted.
 - **WS staleness backfill**: when no messages arrive within `ws_stale_threshold_s`, alerts fire AND a REST sweep via `userFillsByTime` catches missed fills (deduped through state).
+- **Reduce-only on closing trades**: when a leader's fill strictly shrinks an existing opposing position (and doesn't flip through zero), the order is submitted with `reduce_only=True` and bypasses the exposure cap. Flips through zero stay normal orders.
+- **Net-of-fees daily-loss kill**: `realized_pnl_today()` deducts trading fees, so the daily-loss cap actually represents what the operator loses.
+- **Configurable IOC slippage** (`sizing.ioc_slippage_bps`, default 50 bps = 0.5%, range `[0, 1000]`). Set to 0 for no slippage.
+- **Async webhook delivery**: alerts dispatched to a daemon worker via a bounded queue (256). A slow webhook can never block the WS handler thread; oversaturation drops the alert with a warning. Local logging stays synchronous (forensic record). `synchronous=True` flag preserved for tests.
 - **Network mismatch refusal**: bot refuses to start if `HL_NETWORK` env doesn't match `network.hyperliquid_env` in YAML.
 - **WS health monitor** with stale-connection alerts.
 - **Webhook alerts** (Slack/Discord-compatible) for: kill switch trips, daily loss cap, exposure cap, WS staleness, order failures, pipeline exceptions.
@@ -45,8 +49,15 @@ Every leader fill, intent, risk decision, and order outcome is appended to a JSO
 ```bash
 cd ~/hyper-trader
 just setup            # creates .venv, installs runtime + dev deps
-# or manually:
+```
+
+`just` recipes are cross-platform — they pick `.venv/Scripts/...` on Windows, `.venv/bin/...` on Unix. Manual install:
+
+```bash
+# Unix
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+# Windows
+python -m venv .venv && .venv\Scripts\pip install -e ".[dev]"
 ```
 
 ### 2. Configure
@@ -98,7 +109,7 @@ just fmt              # auto-fix lint and reformat
 just typecheck        # mypy
 ```
 
-Current state: **142 tests, 88% coverage** (94–100% on every business module; strict mypy clean; ruff clean). `main.py` integration wiring (36% covered by helpers) runs an infinite loop and is exercised end-to-end at runtime rather than by unit tests.
+Current state: **156 tests passing, ruff/mypy clean** with strict mypy. `main.py` integration wiring runs an infinite loop and is exercised end-to-end at runtime rather than by unit tests.
 
 Pre-commit hooks (`.pre-commit-config.yaml`) run ruff lint + format, mypy, and security checks (`detect-private-key`, `check-merge-conflict`, etc.) on every commit.
 
@@ -131,9 +142,16 @@ Test layout:
 - **Hard caps** in YAML: `max_total_exposure_usd` (cost-basis), `max_daily_loss_usd`, `max_per_trade_usd`.
 - **Agent wallet recommended** so a leaked key can't withdraw funds.
 
+## For LLM agents driving the bot
+
+Two short docs intended for AI co-pilots:
+
+- **[AGENTS.md](AGENTS.md)** — operator runbook for autonomous *coding* agents (e.g. Cursor, Claude Code editing this repo). Setup, secret-handling rules, NEVER-DO list, code-edit conventions.
+- **[TRADING_AGENT.md](TRADING_AGENT.md)** — trading-supervisor playbook for an LLM that *watches* a running bot. Inputs, dry-run → live decision tree, daily P&L tiered response, kill-switch protocol, status report template.
+
 ## Limits and known gaps
 
-- **WS user-sub cap**: Hyperliquid allows max 10 unique users per IP for `userFills` subs — `discovery.top_n` is capped at 10 by `load_config`.
+- **WS user-sub cap**: Hyperliquid allows max 10 unique users per IP for `userFills` subs and the bot's own-fill subscription consumes 1 — `discovery.top_n` is capped at **9** by `load_config`.
 - **HIP-4 in the typed SDK**: outcome markets aren't formally exposed; the bot uses the `coin` string (e.g. `#11`) which the SDK's `Exchange.order()` accepts. Fill schema and `outcomeMeta` endpoint were validated against the live mainnet API; coin notation `#10` (Yes), `#11` (No) confirmed.
 - **Exposure is cost-basis, not mark-to-market**: for fully-collateralized HIP-4 outcomes that's the actual max loss; for perps it under-counts what a liquidation could cost.
 - **No backtest harness** in v1 — testnet is the validation environment.

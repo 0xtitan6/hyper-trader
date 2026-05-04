@@ -100,18 +100,32 @@ class FillFollower:
             if is_snapshot:
                 count = 0
                 for f in fills:
-                    tid = f.get("tid")
-                    if tid is not None:
+                    try:
+                        tid = f.get("tid") if isinstance(f, dict) else None
+                        if tid is None:
+                            continue
                         self.state.mark_tid_seen(int(tid), address)
                         count += 1
+                    except (TypeError, ValueError):
+                        log.warning("Bad tid in snapshot for %s: %r", address[:10], f)
+                        continue
                 log.info("Marked %d snapshot fills as seen for %s", count, address[:10])
                 return
             for f in fills:
-                tid = f.get("tid")
-                if tid is None:
+                try:
+                    if not isinstance(f, dict):
+                        continue
+                    tid = f.get("tid")
+                    if tid is None:
+                        continue
+                    if not self.state.mark_tid_seen(int(tid), address):
+                        continue
+                except (TypeError, ValueError):
+                    log.warning("Bad tid in live fills for %s: %r", address[:10], f)
                     continue
-                if not self.state.mark_tid_seen(int(tid), address):
-                    continue
-                self.on_fill(address, f)
+                try:
+                    self.on_fill(address, f)
+                except Exception:
+                    log.exception("on_fill handler raised for %s tid=%s", address[:10], tid)
         except Exception:
             log.exception("Follower error handling msg for %s", address[:10])

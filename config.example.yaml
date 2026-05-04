@@ -1,6 +1,6 @@
 discovery:
   period: 7d              # 24h | 7d | 30d | all
-  top_n: 5                # max 10 due to Hyperliquid WS user-sub cap
+  top_n: 5                # max 9 — Hyperliquid WS user-sub cap is 10/IP and own-fill sub uses 1
   min_trades: 50
   min_volume_usd: 5000
   min_pnl_usd: 100
@@ -12,6 +12,7 @@ sizing:
   fixed_usd: 25
   max_per_trade_usd: 100
   min_per_trade_usd: 5
+  ioc_slippage_bps: 50    # 0.5% slippage on IOC limit price; range [0, 1000]
 
 risk:
   dry_run: true
