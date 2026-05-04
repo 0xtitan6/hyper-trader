@@ -111,6 +111,10 @@ def main(argv: list[str] | None = None) -> int:
     health.start()
 
     positions = PositionTracker(info, cfg.account_address, state, journal, health)
+    # Reconcile BEFORE subscribing — the WS snapshot can be truncated and the
+    # `user_state` endpoint is the authoritative source for current positions
+    # (also catches HIP-4 settlement that occurred while the bot was down).
+    positions.reconcile_with_user_state()
     positions.start()
 
     liq = LiquidictionClient(cfg.network.liquidiction_base)
@@ -140,14 +144,23 @@ def main(argv: list[str] | None = None) -> int:
 
     stop = install_signal_handler()
     last_refresh = time.time()
+    last_reconcile = time.time()
+    reconcile_interval_s = 300  # 5 min — picks up HIP-4 settlement + manual trades
     log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
     try:
         while not stop.is_set():
             if stop.wait(5):
                 break
-            if time.time() - last_refresh < cfg.discovery.refresh_seconds:
+            now = time.time()
+            if now - last_reconcile >= reconcile_interval_s:
+                last_reconcile = now
+                try:
+                    positions.reconcile_with_user_state()
+                except Exception:
+                    log.exception("Periodic reconcile failed")
+            if now - last_refresh < cfg.discovery.refresh_seconds:
                 continue
-            last_refresh = time.time()
+            last_refresh = now
             try:
                 refreshed = discover_leaders(liq, cfg.discovery)
                 new_addrs = {t.address for t in refreshed}

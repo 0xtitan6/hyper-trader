@@ -100,6 +100,19 @@ def test_schema_idempotent(tmp_path: Path):
     assert s2.is_tid_seen(1) is True
 
 
+def test_unmark_tid_seen_allows_retry(state: State):
+    state.mark_tid_seen(42, "0xabc")
+    assert state.is_tid_seen(42) is True
+    assert state.unmark_tid_seen(42) is True
+    assert state.is_tid_seen(42) is False
+    # After unmark, mark_tid_seen succeeds again (i.e. fill can re-dispatch)
+    assert state.mark_tid_seen(42, "0xabc") is True
+
+
+def test_unmark_tid_seen_missing_returns_false(state: State):
+    assert state.unmark_tid_seen(9999) is False
+
+
 def test_concurrent_mark_tid_seen_only_one_wins(tmp_path: Path):
     import threading
 

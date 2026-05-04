@@ -75,6 +75,16 @@ class State:
             row = conn.execute("SELECT 1 FROM seen_tids WHERE tid = ?", (tid,)).fetchone()
             return row is not None
 
+    def unmark_tid_seen(self, tid: int) -> bool:
+        """Remove a tid from the seen set so it can be retried via backfill.
+        Returns True if a row was deleted, False if it wasn't present.
+        Used after a pipeline error: the leader fill was received but never
+        successfully mirrored, so backfill should pick it up again.
+        """
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM seen_tids WHERE tid = ?", (tid,))
+            return cur.rowcount > 0
+
     def record_own_fill(
         self,
         tid: int,
