@@ -41,14 +41,15 @@ class PositionTracker:
         self._subscribed = False
 
     def start(self) -> None:
-        if self._subscribed:
-            return
-        log.info("Subscribing to own userFills for %s", self.account_address[:10])
-        self.info.subscribe(
-            {"type": "userFills", "user": self.account_address},
-            self._handle,
-        )
-        self._subscribed = True
+        with self._lock:
+            if self._subscribed:
+                return
+            log.info("Subscribing to own userFills for %s", self.account_address[:10])
+            self.info.subscribe(
+                {"type": "userFills", "user": self.account_address},
+                self._handle,
+            )
+            self._subscribed = True
 
     def realized_pnl_today(self) -> float:
         """Net of fees: closedPnl - fee. This is what the daily-loss kill switch checks."""
@@ -64,6 +65,64 @@ class PositionTracker:
         for _coin, (sz, avg_px) in self.state.get_positions().items():
             total += abs(sz) * avg_px
         return total
+
+    def reconcile_with_user_state(self) -> dict[str, tuple[float, float]]:
+        """Overwrite local position state with HL's authoritative `user_state`.
+
+        Run at startup (before the WS snapshot, which can be truncated) and
+        periodically (so HIP-4 settlement, manual trades, and any drift get
+        picked up). Returns the post-reconcile map of {coin: (sz, avg_px)}.
+
+        Coins that exist locally but not upstream are zeroed — that's how
+        settled outcome positions get cleared.
+        """
+        try:
+            us = self.info.user_state(self.account_address) or {}
+        except Exception:
+            log.exception("reconcile: user_state fetch failed; keeping local state")
+            return self.state.get_positions()
+
+        upstream: dict[str, tuple[float, float]] = {}
+        for ap in us.get("assetPositions", []) or []:
+            pos = ap.get("position") if isinstance(ap, dict) else None
+            if not isinstance(pos, dict):
+                continue
+            coin = pos.get("coin")
+            if not coin:
+                continue
+            try:
+                szi = float(pos.get("szi", 0))
+                entry_px = float(pos.get("entryPx", 0) or 0)
+            except (TypeError, ValueError):
+                log.warning("reconcile: malformed position %s", pos)
+                continue
+            upstream[coin] = (szi, entry_px)
+
+        local = self.state.get_positions()
+        with self._lock:
+            for coin, (sz, avg_px) in upstream.items():
+                cur = local.get(coin)
+                if cur != (sz, avg_px):
+                    log.info(
+                        "reconcile: %s local=%s upstream=(%s,%s)",
+                        coin,
+                        cur,
+                        sz,
+                        avg_px,
+                    )
+                self.state.update_position(coin, sz, avg_px)
+            for coin in local.keys() - upstream.keys():
+                cur_sz, _cur_avg = local[coin]
+                if cur_sz != 0:
+                    log.info("reconcile: zeroing %s (was sz=%s)", coin, cur_sz)
+                    self.state.update_position(coin, 0.0, 0.0)
+        self.journal.write(
+            "reconcile",
+            upstream_count=len(upstream),
+            local_count=len(local),
+            zeroed=sorted(local.keys() - upstream.keys()),
+        )
+        return self.state.get_positions()
 
     def _handle(self, msg: Any) -> None:
         if self.health is not None:

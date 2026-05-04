@@ -164,3 +164,95 @@ def test_health_touched_on_msg(state, journal):
     pt.start()
     captured[0](_msg([]))
     health.touch.assert_called_once()
+
+
+def test_reconcile_seeds_positions_from_user_state(state, journal):
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "#11", "szi": "100", "entryPx": "0.54"}},
+            {"position": {"coin": "#12", "szi": "-50", "entryPx": "0.71"}},
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.reconcile_with_user_state()
+    assert state.get_position("#11") == (100.0, 0.54)
+    assert state.get_position("#12") == (-50.0, 0.71)
+
+
+def test_reconcile_zeros_positions_missing_upstream(state, journal):
+    """When a position exists locally but upstream user_state has dropped it
+    (e.g. HIP-4 outcome settled), the local position must be zeroed."""
+    state.update_position("#11", 100.0, 0.50)
+    state.update_position("#12", 25.0, 0.40)
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "#11", "szi": "100", "entryPx": "0.50"}},
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.reconcile_with_user_state()
+    assert state.get_position("#11") == (100.0, 0.50)
+    assert state.get_position("#12") == (0.0, 0.0)  # settled away
+
+
+def test_reconcile_overwrites_drift(state, journal):
+    state.update_position("#11", 80.0, 0.45)  # local is stale
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "#11", "szi": "100", "entryPx": "0.50"}},
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.reconcile_with_user_state()
+    assert state.get_position("#11") == (100.0, 0.50)
+
+
+def test_reconcile_handles_user_state_failure(state, journal):
+    """If user_state fails, keep local state untouched and don't raise."""
+    state.update_position("#11", 100.0, 0.50)
+    info = MagicMock()
+    info.user_state.side_effect = RuntimeError("network")
+    pt = PositionTracker(info, "0xacc", state, journal)
+    result = pt.reconcile_with_user_state()
+    assert state.get_position("#11") == (100.0, 0.50)
+    assert result == {"#11": (100.0, 0.50)}
+
+
+def test_reconcile_handles_malformed_position(state, journal):
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "#11", "szi": "garbage", "entryPx": "0.5"}},  # bad szi
+            {"position": {"coin": "", "szi": "10", "entryPx": "0.5"}},  # empty coin
+            {"position": {"coin": "#12", "szi": "20", "entryPx": "0.6"}},  # good
+            {"position": "not a dict"},  # nested junk
+            "not a dict",  # outer junk
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.reconcile_with_user_state()
+    assert state.get_position("#12") == (20.0, 0.6)
+    assert state.get_position("#11") == (0.0, 0.0)
+    assert state.get_position("") == (0.0, 0.0)
+
+
+def test_reconcile_journals_event(state, journal, tmp_path):
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "#11", "szi": "10", "entryPx": "0.5"}},
+        ]
+    }
+    state.update_position("#stale", 5.0, 0.3)
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.reconcile_with_user_state()
+    import json
+
+    with open(journal.path) as f:
+        lines = [json.loads(line) for line in f]
+    reconcile_events = [e for e in lines if e["event"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert "#stale" in reconcile_events[0]["zeroed"]

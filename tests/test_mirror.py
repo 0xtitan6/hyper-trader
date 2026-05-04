@@ -301,6 +301,35 @@ def test_reduce_only_bypasses_exposure_cap(
     assert exchange.order.call_args.kwargs["reduce_only"] is True
 
 
+def test_pipeline_error_unmarks_tid_for_retry(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    """A pipeline error (non-OrderError) must unmark the tid so backfill can
+    re-dispatch the fill. OrderError must NOT unmark (order was attempted)."""
+    # Inject a failure inside the risk-check path so the generic Exception
+    # branch fires instead of the OrderError branch.
+    positions.realized_pnl_today.side_effect = RuntimeError("boom")
+    mt = MirrorTrader(cfg, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)  # tid=1001 from outcome_fill fixture
+    positions.state.unmark_tid_seen.assert_called_once_with(1001)
+
+
+def test_order_failure_does_not_unmark_tid(
+    cfg, positions, journal, exchange, outcome_fill, market_meta
+):
+    """OrderError = HL rejected our submitted order. The tid must STAY marked
+    so we don't accidentally retry and submit a duplicate trade."""
+    from src.errors import OrderError
+
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange.order.side_effect = RuntimeError("HL rejected")
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    with pytest.raises(OrderError):
+        mt.on_leader_fill("0xleader", outcome_fill)
+    positions.state.unmark_tid_seen.assert_not_called()
+
+
 def test_post_round_min_skip(cfg, positions, journal, alerter, exchange, market_meta):
     # Outcome rounds to integer shares. raw_sz = 5.5 / 0.5 = 11; rounded = 11; OK.
     # But a price=$1, notional=$5.5, raw_sz=5.5, rounded to 5, post-round notional=5

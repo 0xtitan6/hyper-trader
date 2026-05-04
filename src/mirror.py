@@ -1,6 +1,6 @@
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from threading import Lock
 
 from .alerts import Alerter
@@ -61,6 +61,12 @@ class MirrorTrader:
                 self.journal.write("intent_skipped", leader=leader, tid=tid, reason="filter")
                 return
             with self._submit_lock:
+                # Re-evaluate reduce_only inside the lock — position state may
+                # have changed (own-fill arrived) between _build_intent and here.
+                intent = replace(
+                    intent,
+                    reduce_only=self._is_reduce_only(intent.coin, intent.is_buy, intent.sz),
+                )
                 ok, reason = self._risk_check(intent)
                 self.journal.write(
                     "risk_check",
@@ -85,6 +91,10 @@ class MirrorTrader:
                 f"Mirror pipeline exception leader={leader[:10]} tid={tid}",
             )
             self.journal.write("pipeline_error", leader=leader, tid=tid)
+            # Unmark so backfill can re-dispatch this fill. OrderError stays
+            # marked (the order was attempted; retrying could double-trade).
+            if isinstance(tid, int):
+                self.positions.state.unmark_tid_seen(tid)
 
     def _build_intent(self, fill: dict) -> TradeIntent | None:
         coin = fill.get("coin")
@@ -124,14 +134,14 @@ class MirrorTrader:
         if rounded_notional < s.min_per_trade_usd:
             return None
 
-        reduce_only = self._is_reduce_only(coin, is_buy, rounded_sz)
+        # reduce_only deferred — evaluated inside _submit_lock against fresh state.
         return TradeIntent(
             coin=coin,
             is_buy=is_buy,
             sz=rounded_sz,
             limit_px=rounded_px,
             notional_usd=rounded_notional,
-            reduce_only=reduce_only,
+            reduce_only=False,
         )
 
     def _is_reduce_only(self, coin: str, is_buy: bool, sz: float) -> bool:
