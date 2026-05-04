@@ -1,0 +1,33 @@
+discovery:
+  period: 7d              # 24h | 7d | 30d | all
+  top_n: 5                # max 10 due to Hyperliquid WS user-sub cap
+  min_trades: 50
+  min_volume_usd: 5000
+  min_pnl_usd: 100
+  refresh_seconds: 600
+
+sizing:
+  mode: proportional      # proportional | fixed
+  proportional_fraction: 0.10
+  fixed_usd: 25
+  max_per_trade_usd: 100
+  min_per_trade_usd: 5
+
+risk:
+  dry_run: true
+  max_total_exposure_usd: 500
+  max_daily_loss_usd: 100
+  allowed_market_types: [outcome]   # outcome | perp | spot
+  kill_switch_file: ./KILL
+
+network:
+  hyperliquid_env: testnet
+  liquidiction_base: https://liquidiction.xyz
+
+ops:
+  state_db: ./state/state.db
+  journal_path: ./state/journal.jsonl
+  log_level: INFO
+  log_json: false
+  ws_stale_threshold_s: 120
+  alert_min_level: warn   # info | warn | error | critical

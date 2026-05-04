@@ -1,0 +1,119 @@
+import logging
+import signal
+import threading
+import time
+
+from eth_account import Account
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+
+from .alerts import NullAlerter, WebhookAlerter
+from .config import load_config
+from .connection import ConnectionHealth
+from .follower import FillFollower
+from .journal import Journal
+from .leaders import discover_leaders
+from .liquidiction import LiquidictionClient
+from .log import setup_logging
+from .mirror import MirrorTrader
+from .positions import PositionTracker
+from .state import State
+
+log = logging.getLogger(__name__)
+
+
+def main() -> None:
+    cfg = load_config("config.yaml")
+    setup_logging(level=cfg.ops.log_level, json_mode=cfg.ops.log_json)
+
+    log.info(
+        "hyper-trader starting env=%s dry_run=%s account=%s",
+        cfg.network.hyperliquid_env,
+        cfg.risk.dry_run,
+        cfg.account_address,
+    )
+
+    state = State(cfg.ops.state_db)
+    journal = Journal(cfg.ops.journal_path)
+    alerter = (
+        WebhookAlerter(cfg.webhook_url, min_level=cfg.ops.alert_min_level)
+        if cfg.webhook_url
+        else NullAlerter()
+    )
+
+    wallet = Account.from_key(cfg.private_key)
+    info = Info(cfg.hyperliquid_api_url, skip_ws=False)
+    exchange = Exchange(wallet, cfg.hyperliquid_api_url, account_address=cfg.account_address)
+
+    health = ConnectionHealth(alerter, stale_threshold_s=cfg.ops.ws_stale_threshold_s)
+    health.start()
+
+    positions = PositionTracker(info, cfg.account_address, state, journal, health)
+    positions.start()
+
+    liq = LiquidictionClient(cfg.network.liquidiction_base)
+    leaders = discover_leaders(liq, cfg.discovery)
+    if not leaders:
+        log.error("No leaders matched filters; aborting.")
+        journal.write("startup_aborted", reason="no_leaders")
+        health.stop()
+        return
+
+    journal.write(
+        "startup",
+        env=cfg.network.hyperliquid_env,
+        dry_run=cfg.risk.dry_run,
+        leaders=[t.address for t in leaders],
+    )
+    alerter.alert(
+        "info",
+        f"hyper-trader started env={cfg.network.hyperliquid_env} "
+        f"dry_run={cfg.risk.dry_run} leaders={len(leaders)}",
+    )
+
+    mirror = MirrorTrader(cfg, exchange, positions, journal, alerter)
+    follower = FillFollower(info, mirror.on_leader_fill, state, health)
+    follower.follow([t.address for t in leaders])
+
+    stop = _install_signal_handler()
+    last_refresh = time.time()
+    log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
+    try:
+        while not stop.is_set():
+            if stop.wait(5):
+                break
+            if time.time() - last_refresh < cfg.discovery.refresh_seconds:
+                continue
+            last_refresh = time.time()
+            try:
+                refreshed = discover_leaders(liq, cfg.discovery)
+                new_addrs = {t.address for t in refreshed}
+                cur_addrs = {t.address for t in leaders}
+                added = new_addrs - cur_addrs
+                if added:
+                    log.info("Adding %d new leaders to follow set", len(added))
+                    follower.follow(sorted(added))
+                leaders = refreshed
+            except Exception:
+                log.exception("Leader refresh failed")
+    finally:
+        log.info("Shutting down.")
+        journal.write("shutdown")
+        alerter.alert("info", "hyper-trader stopping")
+        health.stop()
+
+
+def _install_signal_handler() -> threading.Event:
+    stop = threading.Event()
+
+    def handler(signum: int, _frame: object) -> None:
+        log.info("Received signal %d; initiating shutdown", signum)
+        stop.set()
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+    return stop
+
+
+if __name__ == "__main__":
+    main()
