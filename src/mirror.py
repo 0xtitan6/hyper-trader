@@ -119,8 +119,17 @@ class MirrorTrader:
         else:
             return None
 
+        # Outcomes have a separate (typically higher) min — HL enforces $10
+        # USDH min on HIP-4 orders. Perps allow much smaller mirror sizes.
+        is_outcome = coin.startswith("#") or coin.startswith("+")
+        effective_min = (
+            s.outcome_min_per_trade_usd
+            if is_outcome and s.outcome_min_per_trade_usd is not None
+            else s.min_per_trade_usd
+        )
+
         mirror_notional = min(mirror_notional, s.max_per_trade_usd)
-        if mirror_notional < s.min_per_trade_usd:
+        if mirror_notional < effective_min:
             return None
 
         raw_sz = mirror_notional / px
@@ -131,7 +140,7 @@ class MirrorTrader:
         rounded_notional = rounded_sz * rounded_px
         # Re-check min after rounding — szDecimals=0 outcomes can drop us below
         # the floor even though the raw notional was above it.
-        if rounded_notional < s.min_per_trade_usd:
+        if rounded_notional < effective_min:
             return None
 
         # reduce_only deferred — evaluated inside _submit_lock against fresh state.
