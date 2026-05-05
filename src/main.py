@@ -14,6 +14,7 @@ from .config import Config, load_config
 from .connection import ConnectionHealth
 from .errors import PreflightError
 from .follower import FillFollower
+from .hl_outcome import register_outcome_assets
 from .journal import Journal
 from .leaders import discover_leaders
 from .liquidiction import LiquidictionClient
@@ -84,12 +85,20 @@ def main(argv: list[str] | None = None) -> int:
     market_meta = MarketMeta(info)
     market_meta.load()
 
+    # Register HIP-4 outcome assets so Exchange.order("#NN", ...) resolves —
+    # the upstream SDK omits these from coin_to_asset.
+    n_outcomes = register_outcome_assets(info)
+    log.info("Registered %d HIP-4 outcome legs for trading", n_outcomes)
+
     state = State(cfg.ops.state_db)
     journal = Journal(cfg.ops.journal_path)
     alerter = build_alerter(cfg)
 
     wallet = Account.from_key(cfg.private_key)
     exchange = Exchange(wallet, cfg.hyperliquid_api_url, account_address=cfg.account_address)
+    # Exchange spawns its own internal Info — patch THAT too, otherwise
+    # exchange.order("#NN", ...) still fails despite our outer info patch.
+    register_outcome_assets(exchange.info)
 
     # Backfill closure — wired into ConnectionHealth so a stale WS triggers a REST sweep
     follower_holder: dict[str, FillFollower] = {}
