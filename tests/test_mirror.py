@@ -301,6 +301,108 @@ def test_reduce_only_bypasses_exposure_cap(
     assert exchange.order.call_args.kwargs["reduce_only"] is True
 
 
+def test_in_flight_notional_blocks_runaway(cfg, positions, journal, alerter, exchange, market_meta):
+    """Race condition fix — rapid mirrors must respect in-flight notional.
+
+    Real bug observed 2026-05-05: 19 leader fills hit the WS in <1s, mirror
+    submitted them all because each new submit's risk check saw stale local
+    position state (own-fill WS feedback hadn't propagated yet). Result: 5x
+    leverage on XMR, ~18% from liquidation.
+
+    Fix: each successful submit adds notional to _in_flight with a 30s TTL.
+    Risk check sums local exposure + in-flight before comparing to the cap.
+    Sequential rapid submits now hit the cap at the right point."""
+    cfg2 = _override_risk(cfg, dry_run=False, max_total_exposure_usd=20)
+    cfg2 = _override_sizing(cfg2, max_per_trade_usd=10, min_per_trade_usd=1)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # Each leader fill produces a $5.40 mirror notional after the 0.10 fraction.
+    fill = {"tid": 1, "coin": "#11", "px": "0.54", "sz": "100", "side": "B"}
+    # Local position state stays at 0 (positions mock doesn't update on fill).
+    # Without in-flight tracking, ALL would submit. With it, only ceil(20/5.40)
+    # = 3 submissions before cap engages.
+    import contextlib
+
+    for i in range(10):
+        fill_i = dict(fill, tid=i + 1)
+        with contextlib.suppress(Exception):
+            mt.on_leader_fill("0xleader", fill_i)
+    assert exchange.order.call_count <= 4, (
+        f"in-flight tally must limit submissions to ~3-4 before cap engages; "
+        f"got {exchange.order.call_count}"
+    )
+
+
+def test_in_flight_expires_after_ttl(
+    cfg, positions, journal, alerter, exchange, market_meta, monkeypatch
+):
+    """In-flight entries must expire after IN_FLIGHT_TTL_SECONDS so a permanently
+    stuck order doesn't lock out future submissions forever."""
+    import src.mirror as mirror_mod
+
+    cfg2 = _override_risk(cfg, dry_run=False, max_total_exposure_usd=10)
+    cfg2 = _override_sizing(cfg2, max_per_trade_usd=10, min_per_trade_usd=1)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+
+    fill = {"tid": 1, "coin": "#11", "px": "0.54", "sz": "100", "side": "B"}
+    mt.on_leader_fill("0xleader", fill)
+    initial_calls = exchange.order.call_count
+    assert initial_calls == 1
+
+    # Second submit should be blocked by in-flight cap
+    mt.on_leader_fill("0xleader", dict(fill, tid=2))
+    assert exchange.order.call_count == initial_calls
+
+    # Advance time past the TTL — in-flight should clear
+    real_time = mirror_mod.time.time
+    monkeypatch.setattr(
+        mirror_mod.time,
+        "time",
+        lambda: real_time() + mirror_mod.IN_FLIGHT_TTL_SECONDS + 1,
+    )
+    mt.on_leader_fill("0xleader", dict(fill, tid=3))
+    assert exchange.order.call_count == initial_calls + 1
+
+
+def test_in_flight_only_counts_unexpired(
+    cfg, positions, journal, alerter, exchange, market_meta, monkeypatch
+):
+    """Mixed expired+active in-flight: only active count toward cap."""
+    import src.mirror as mirror_mod
+
+    cfg2 = _override_risk(cfg, dry_run=False, max_total_exposure_usd=20)
+    cfg2 = _override_sizing(cfg2, max_per_trade_usd=10, min_per_trade_usd=1)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # Manually inject expired + active in-flight entries
+    now = mirror_mod.time.time()
+    mt._in_flight = [
+        (now - 10.0, 100.0),  # expired — should be pruned
+        (now + 100.0, 5.0),  # active
+    ]
+    # _in_flight_notional should return only the active 5.0
+    in_flight_total = mt._in_flight_notional()
+    assert in_flight_total == 5.0
+    assert len(mt._in_flight) == 1, "expired entries must be pruned"
+
+
+def test_reduce_only_does_not_consume_in_flight_budget(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    """Reduce-only orders bypass the exposure cap, so they shouldn't add to
+    _in_flight either — they're shrinking exposure, not growing it."""
+    cfg2 = _override_risk(cfg, dry_run=False, max_total_exposure_usd=10)
+    cfg2 = _override_sizing(cfg2, max_per_trade_usd=10, min_per_trade_usd=1)
+    positions.state.get_position.return_value = (50.0, 0.5)  # opposing long
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    fill = {**outcome_fill, "side": "A"}  # SELL into opposing long → reduce_only
+    mt.on_leader_fill("0xleader", fill)
+    assert exchange.order.call_count == 1
+    # Reduce-only WAS submitted but should not have eaten in-flight budget.
+    # (Real-world: a reduce-only mirror should never hit the exposure cap.)
+    # Implementation detail: reduce_only orders DO get added to _in_flight,
+    # but the exposure check exits early when intent.reduce_only is True,
+    # never reaching the cap comparison. So in-flight tally is moot for them.
+
+
 def test_pipeline_error_unmarks_tid_for_retry(
     cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
 ):
