@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     positions.start()
 
     liq = LiquidictionClient(cfg.network.liquidiction_base)
-    leaders = discover_leaders(liq, cfg.discovery)
+    leaders = discover_leaders(liq, cfg.discovery, info=info)
     if not leaders:
         log.error("No leaders matched filters; aborting.")
         journal.write("startup_aborted", reason="no_leaders")
@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             last_refresh = now
             try:
-                refreshed = discover_leaders(liq, cfg.discovery)
+                refreshed = discover_leaders(liq, cfg.discovery, info=info)
                 new_addrs = {t.address for t in refreshed}
                 cur_addrs = {t.address for t in leaders}
                 added = new_addrs - cur_addrs
