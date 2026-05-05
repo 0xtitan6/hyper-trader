@@ -379,6 +379,53 @@ def test_settlement_winning_position_emits_won(state, journal):
     assert "won" in crit[0].args[1]
 
 
+def test_spot_pair_fill_does_not_create_position(state, journal):
+    """HL spot pair fills (coin starts with `@`) are stablecoin swaps and other
+    spot trades — they must NOT be tracked as positions. Real-world bug: a
+    USDC→USDH swap on @230 was registered as a phantom short, eating $54 of
+    our $60 exposure cap and blocking all perp mirroring."""
+    _pt, cbs = _make_tracker(state, journal)
+    cbs[0](_msg([_f(1, "A", 54.73, 1.0, coin="@230")]))
+    sz, _avg = state.get_position("@230")
+    assert sz == 0.0, "spot pair must not become a tracked position"
+
+
+def test_spot_pair_fill_with_slash_skipped(state, journal):
+    """Slash notation (e.g. PURR/USDC) is also a spot pair — same skip rule."""
+    _pt, cbs = _make_tracker(state, journal)
+    cbs[0](_msg([_f(2, "B", 100.0, 1.5, coin="PURR/USDC")]))
+    sz, _ = state.get_position("PURR/USDC")
+    assert sz == 0.0
+
+
+def test_spot_pair_fill_journals_skip_event(state, journal):
+    """Skipped fills get a forensic record so we can audit what was filtered."""
+    _pt, cbs = _make_tracker(state, journal)
+    cbs[0](_msg([_f(3, "A", 10.0, 1.0, coin="@230")]))
+    import json
+
+    with open(journal.path) as f:
+        events = [json.loads(line)["event"] for line in f]
+    assert "own_fill_skipped" in events
+
+
+def test_perp_and_outcome_fills_still_tracked(state, journal):
+    """Filter must NOT affect perps (BTC, ETH, etc.) or outcomes (#NN)."""
+    _pt, cbs = _make_tracker(state, journal)
+    cbs[0](
+        _msg(
+            [
+                _f(10, "B", 0.001, 50000.0, coin="BTC"),  # perp — should track
+                _f(11, "B", 100.0, 0.50, coin="#11"),  # outcome — should track
+            ]
+        )
+    )
+    btc_sz, _ = state.get_position("BTC")
+    out_sz, _ = state.get_position("#11")
+    assert btc_sz == 0.001
+    assert out_sz == 100.0
+
+
 def test_settlement_journals_event(state, journal, tmp_path):
     info = MagicMock()
     captured: list = []

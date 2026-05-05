@@ -11,8 +11,9 @@ sizing:
   proportional_fraction: 0.10
   fixed_usd: 25
   max_per_trade_usd: 100
-  min_per_trade_usd: 5
-  ioc_slippage_bps: 50    # 0.5% slippage on IOC limit price; range [0, 1000]
+  min_per_trade_usd: 10            # HL enforces $10 min on perp orders (and outcomes)
+  outcome_min_per_trade_usd: 10    # Optional explicit override for HIP-4 outcomes
+  ioc_slippage_bps: 50             # 0.5% slippage on IOC limit price; range [0, 1000]
 
 risk:
   dry_run: true
