@@ -1,36 +1,93 @@
 import logging
 
 from .config import DiscoveryConfig
+from .leader_score import load_metrics, meets_quality
 from .liquidiction import LiquidictionClient, Trader
+from .protocols import InfoProto
 
 log = logging.getLogger(__name__)
 
 
-def discover_leaders(client: LiquidictionClient, cfg: DiscoveryConfig) -> list[Trader]:
+def discover_leaders(
+    client: LiquidictionClient,
+    cfg: DiscoveryConfig,
+    info: InfoProto | None = None,
+) -> list[Trader]:
+    """Pull top traders from Liquidiction, then optionally filter through
+    a per-leader quality scorer (`leader_score.meets_quality`) using their
+    own fill history from HL.
+
+    The Liquidiction filters (`min_trades`, `min_volume_usd`, `min_pnl_usd`)
+    are coarse — they pass leaders with high raw PnL even if that PnL came
+    from a single lucky position. The score filter catches scalpers
+    (low time_between_fills) and flip-floppers (low direction_consistency).
+
+    Pass `info=None` to skip the quality scorer (legacy behavior — useful
+    for tests that don't want HL fill round-trips).
+    """
     candidates = client.top_traders(period=cfg.period, n=max(cfg.top_n * 4, 50))
-    filtered = [
+    coarse_filtered = [
         t
         for t in candidates
         if t.trades >= cfg.min_trades
         and t.volume >= cfg.min_volume_usd
         and t.pnl >= cfg.min_pnl_usd
     ]
-    selected = filtered[: cfg.top_n]
+
+    # Quality filter: only enabled when info is provided AND config requests it
+    score_enabled = info is not None and cfg.use_quality_filter
+    selected: list[Trader] = []
+    rejected_for_score: list[tuple[Trader, str]] = []
+
+    if score_enabled:
+        assert info is not None  # narrowed by score_enabled
+        for t in coarse_filtered:
+            metrics = load_metrics(info, t.address, lookback_hours=cfg.score_lookback_hours)
+            if metrics is None:
+                rejected_for_score.append((t, "metrics_unavailable"))
+                continue
+            ok, reason = meets_quality(
+                metrics,
+                min_holding_s=cfg.min_holding_time_s,
+                min_sharpe=cfg.min_sharpe,
+                min_realized_pnl_usd=cfg.min_pnl_usd,
+                min_direction_consistency=cfg.min_direction_consistency,
+                min_trades=cfg.min_trades,
+            )
+            if ok:
+                selected.append(t)
+                if len(selected) >= cfg.top_n:
+                    break
+            else:
+                rejected_for_score.append((t, reason))
+    else:
+        selected = coarse_filtered[: cfg.top_n]
+
     if selected:
         log.info(
-            "Selected %d/%d leaders (period=%s): %s",
+            "Selected %d/%d leaders (period=%s, quality_filter=%s): %s",
             len(selected),
             len(candidates),
             cfg.period,
+            score_enabled,
             ", ".join(
                 f"{t.address[:10]}…(rank={t.rank}, pnl=${t.pnl:.0f}, trades={t.trades})"
                 for t in selected
             ),
         )
+        if rejected_for_score:
+            log.info(
+                "Quality filter rejected %d candidates. First few: %s",
+                len(rejected_for_score),
+                ", ".join(f"{t.address[:10]}…({reason})" for t, reason in rejected_for_score[:5]),
+            )
     else:
         log.warning(
-            "No leaders matched filters (candidates=%d, min_trades=%d, min_volume=%.0f, min_pnl=%.0f)",
+            "No leaders matched filters (candidates=%d, coarse=%d, "
+            "rejected_by_score=%d, min_trades=%d, min_volume=%.0f, min_pnl=%.0f)",
             len(candidates),
+            len(coarse_filtered),
+            len(rejected_for_score),
             cfg.min_trades,
             cfg.min_volume_usd,
             cfg.min_pnl_usd,
