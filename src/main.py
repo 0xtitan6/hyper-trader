@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     health.start()
 
-    positions = PositionTracker(info, cfg.account_address, state, journal, health)
+    positions = PositionTracker(info, cfg.account_address, state, journal, health, alerter=alerter)
     # Reconcile BEFORE subscribing — the WS snapshot can be truncated and the
     # `user_state` endpoint is the authoritative source for current positions
     # (also catches HIP-4 settlement that occurred while the bot was down).

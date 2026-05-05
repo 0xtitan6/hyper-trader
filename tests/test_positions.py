@@ -239,6 +239,175 @@ def test_reconcile_handles_malformed_position(state, journal):
     assert state.get_position("") == (0.0, 0.0)
 
 
+def test_reconcile_picks_up_outcome_positions_from_spot(state, journal):
+    """HIP-4 outcomes live in spotClearinghouseState.balances as `+NN`, NOT
+    in assetPositions. Without this, local outcome positions get zeroed every
+    reconcile cycle even though we still own them — this was a real bug
+    that would have wiped our position state in production."""
+    info = MagicMock()
+    info.user_state.return_value = {"assetPositions": []}
+    info.post.return_value = {
+        "balances": [
+            {"coin": "USDC", "total": "5.0", "entryNtl": "0.0"},
+            {"coin": "+21", "total": "33.0", "entryNtl": "10.25"},  # our NO position
+            {"coin": "+20", "total": "0.0", "entryNtl": "0.0"},  # zeroed leg
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    result = pt.reconcile_with_user_state()
+    # Translated +21 -> #21 with avg_px = 10.25/33
+    assert "#21" in result
+    sz, avg = result["#21"]
+    assert sz == 33.0
+    assert abs(avg - 10.25 / 33) < 1e-6
+
+
+def test_reconcile_handles_spot_fetch_failure(state, journal):
+    """If spotClearinghouseState fails, perp reconcile must still work."""
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.1", "entryPx": "50000"}}]
+    }
+    info.post.side_effect = RuntimeError("spot endpoint down")
+    pt = PositionTracker(info, "0xacc", state, journal)
+    result = pt.reconcile_with_user_state()
+    assert result == {"BTC": (0.1, 50000.0)}
+
+
+def test_reconcile_skips_non_outcome_spot_balances(state, journal):
+    """Only `+NN` outcome legs become positions; USDC/USDH/etc are not."""
+    info = MagicMock()
+    info.user_state.return_value = {"assetPositions": []}
+    info.post.return_value = {
+        "balances": [
+            {"coin": "USDC", "total": "100.0", "entryNtl": "0.0"},
+            {"coin": "USDH", "total": "50.0", "entryNtl": "50.0"},
+            {"coin": "PURR", "total": "10.0", "entryNtl": "10.0"},  # spot token, not outcome
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    result = pt.reconcile_with_user_state()
+    assert result == {}
+
+
+def test_settlement_fill_handled_specially(state, journal):
+    """A settlement fill (dir=Settlement, px=0) must zero the position and
+    record the closed_pnl, not be rejected as malformed for px<=0."""
+    info = MagicMock()
+    captured: list = []
+    info.subscribe.side_effect = lambda s, c: captured.append(c)
+    state.update_position("#21", 33.0, 0.31062)  # we own 33 NO shares
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.start()
+
+    settlement_fill = {
+        "tid": 999,
+        "coin": "#21",
+        "side": "A",
+        "sz": "33.0",
+        "px": "0.0",
+        "closedPnl": "-10.25",
+        "fee": "0.0",
+        "time": 1714500000000,
+        "dir": "Settlement",
+    }
+    captured[0]({"data": {"isSnapshot": False, "fills": [settlement_fill]}})
+
+    # Position should be zeroed
+    sz, _avg = state.get_position("#21")
+    assert sz == 0.0
+    # Daily P&L should reflect the settlement loss
+    pnl, _fee = state.daily_pnl(
+        __import__("datetime")
+        .datetime.fromtimestamp(1714500000, tz=__import__("datetime").timezone.utc)
+        .strftime("%Y-%m-%d")
+    )
+    assert abs(pnl - (-10.25)) < 1e-6
+
+
+def test_settlement_emits_critical_alert(state, journal):
+    """Settlement must alert critically so webhooks fire even when no agent
+    is supervising — this was the failure mode that lost the operator's
+    settlement notification on the BTC binary."""
+    info = MagicMock()
+    captured: list = []
+    info.subscribe.side_effect = lambda s, c: captured.append(c)
+    alerter = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal, alerter=alerter)
+    pt.start()
+
+    settlement_fill = {
+        "tid": 1000,
+        "coin": "#21",
+        "side": "A",
+        "sz": "33.0",
+        "px": "0.0",
+        "closedPnl": "-10.25",
+        "fee": "0.0",
+        "time": 1714500000000,
+        "dir": "Settlement",
+    }
+    captured[0]({"data": {"isSnapshot": False, "fills": [settlement_fill]}})
+
+    # Critical alert with verdict
+    crit = [c for c in alerter.alert.call_args_list if c.args[0] == "critical"]
+    assert len(crit) == 1
+    assert "SETTLEMENT" in crit[0].args[1]
+    assert "lost" in crit[0].args[1]
+
+
+def test_settlement_winning_position_emits_won(state, journal):
+    info = MagicMock()
+    captured: list = []
+    info.subscribe.side_effect = lambda s, c: captured.append(c)
+    alerter = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal, alerter=alerter)
+    pt.start()
+    win_fill = {
+        "tid": 1001,
+        "coin": "#20",
+        "side": "A",
+        "sz": "10.0",
+        "px": "1.0",
+        "closedPnl": "5.0",
+        "fee": "0.0",
+        "time": 1714500000000,
+        "dir": "Settlement",
+    }
+    captured[0]({"data": {"isSnapshot": False, "fills": [win_fill]}})
+    crit = [c for c in alerter.alert.call_args_list if c.args[0] == "critical"]
+    assert "won" in crit[0].args[1]
+
+
+def test_settlement_journals_event(state, journal, tmp_path):
+    info = MagicMock()
+    captured: list = []
+    info.subscribe.side_effect = lambda s, c: captured.append(c)
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.start()
+    fill = {
+        "tid": 2000,
+        "coin": "#21",
+        "side": "A",
+        "sz": "33.0",
+        "px": "0.0",
+        "closedPnl": "-10.25",
+        "fee": "0.0",
+        "time": 1714500000000,
+        "dir": "Settlement",
+    }
+    captured[0]({"data": {"isSnapshot": False, "fills": [fill]}})
+    import json
+
+    with open(journal.path) as f:
+        events = [json.loads(line) for line in f]
+    settlements = [e for e in events if e["event"] == "settlement"]
+    assert len(settlements) == 1
+    assert settlements[0]["coin"] == "#21"
+    assert settlements[0]["verdict"] == "lost"
+    assert settlements[0]["closed_pnl"] == -10.25
+
+
 def test_reconcile_journals_event(state, journal, tmp_path):
     info = MagicMock()
     info.user_state.return_value = {
