@@ -24,6 +24,11 @@ class SizingConfig:
     max_per_trade_usd: float
     min_per_trade_usd: float
     ioc_slippage_bps: float = 50.0  # 0.5% default
+    # Per-market-type minimums (override min_per_trade_usd if set).
+    # HL HIP-4 outcomes have a $10 USDH minimum order value; perps allow much
+    # smaller. Setting outcome_min_per_trade_usd separately lets perp trades
+    # mirror at small sizes without blocking outcome attempts.
+    outcome_min_per_trade_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,14 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
         raise SystemExit(
             f"sizing.ioc_slippage_bps must be in [0, 1000] bps, got {sizing.ioc_slippage_bps}"
         )
+    if sizing.outcome_min_per_trade_usd is not None:
+        if sizing.outcome_min_per_trade_usd <= 0:
+            raise SystemExit("sizing.outcome_min_per_trade_usd must be positive")
+        if sizing.outcome_min_per_trade_usd > sizing.max_per_trade_usd:
+            raise SystemExit(
+                "sizing.outcome_min_per_trade_usd > max_per_trade_usd "
+                "— outcome trades would always be rejected"
+            )
 
     risk = RiskConfig(**raw["risk"])
     valid_markets = {"outcome", "perp", "spot"}

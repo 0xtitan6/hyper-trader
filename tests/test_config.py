@@ -133,6 +133,28 @@ def test_min_above_max_size(tmp_path, good_env):
         load_config(_write_yaml(tmp_path, raw), env=good_env)
 
 
+def test_outcome_min_negative_rejected(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["sizing"]["outcome_min_per_trade_usd"] = -5
+    with pytest.raises(SystemExit, match="outcome_min_per_trade_usd"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_outcome_min_above_max_rejected(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["sizing"]["outcome_min_per_trade_usd"] = 999  # > max_per_trade_usd
+    with pytest.raises(SystemExit, match="outcome_min_per_trade_usd"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_outcome_min_optional(tmp_path, good_env):
+    """Omitting outcome_min_per_trade_usd loads cleanly (falls back to global min)."""
+    raw = _base_yaml()
+    raw["sizing"].pop("outcome_min_per_trade_usd", None)
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.sizing.outcome_min_per_trade_usd is None
+
+
 def test_invalid_market_type(tmp_path, good_env):
     raw = _base_yaml()
     raw["risk"]["allowed_market_types"] = ["bogus"]

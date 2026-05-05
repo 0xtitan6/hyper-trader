@@ -330,6 +330,45 @@ def test_order_failure_does_not_unmark_tid(
     positions.state.unmark_tid_seen.assert_not_called()
 
 
+def test_outcome_min_overrides_global_min(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    """HL enforces $10 USDH min on outcomes. With outcome_min_per_trade_usd=10
+    set, outcome trades below $10 must skip even if global min_per_trade_usd
+    would allow them."""
+    cfg2 = _override_sizing(cfg, min_per_trade_usd=1.0, outcome_min_per_trade_usd=10.0)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # outcome_fill: 100 sz @ 0.54, 0.10 frac → mirror notional $5.40 → below $10 outcome min
+    mt.on_leader_fill("0xleader", outcome_fill)
+    exchange.order.assert_not_called()
+
+
+def test_outcome_min_does_not_block_perps(cfg, positions, journal, alerter, exchange, market_meta):
+    """outcome_min_per_trade_usd should NOT affect perp trades — they use the
+    standard min_per_trade_usd. A $5 perp trade should pass when outcome_min=10."""
+    cfg2 = _override_sizing(cfg, min_per_trade_usd=1.0, outcome_min_per_trade_usd=10.0)
+    cfg2 = _override_risk(cfg2, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # Perp BTC fill: 0.001 sz @ $50000 → leader notional $50, mirror 0.10 = $5
+    fill = {"tid": 99, "coin": "BTC", "px": "50000", "sz": "0.001", "side": "B"}
+    mt.on_leader_fill("0xleader", fill)
+    exchange.order.assert_called_once()
+
+
+def test_outcome_min_none_falls_back_to_global_min(
+    cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
+):
+    """When outcome_min_per_trade_usd is None (default), outcomes use the
+    global min_per_trade_usd — preserves prior behavior."""
+    cfg2 = _override_sizing(cfg, min_per_trade_usd=1.0, outcome_min_per_trade_usd=None)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # outcome_fill notional $5.40 ≥ $1 global min → submits
+    mt.on_leader_fill("0xleader", outcome_fill)
+    exchange.order.assert_called_once()
+
+
 def test_post_round_min_skip(cfg, positions, journal, alerter, exchange, market_meta):
     # Outcome rounds to integer shares. raw_sz = 5.5 / 0.5 = 11; rounded = 11; OK.
     # But a price=$1, notional=$5.5, raw_sz=5.5, rounded to 5, post-round notional=5
