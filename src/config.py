@@ -14,6 +14,16 @@ class DiscoveryConfig:
     min_volume_usd: float
     min_pnl_usd: float
     refresh_seconds: int
+    # Quality filter — opt-in. When True, candidates from Liquidiction are
+    # additionally screened via leader_score.meets_quality which queries each
+    # candidate's HL fills and computes holding-time, direction-consistency,
+    # Sharpe, and drawdown. Catches scalpers + flip-floppers that raw PnL
+    # ranking lets through.
+    use_quality_filter: bool = False
+    score_lookback_hours: float = 168.0  # 7d
+    min_holding_time_s: float = 300.0  # 5 min — reject sub-second scalpers
+    min_sharpe: float = 0.0  # only reject negative Sharpe by default
+    min_direction_consistency: float = 0.55  # reject pure flip-flop (0.5 = even split)
 
 
 @dataclass(frozen=True)
@@ -149,6 +159,17 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
     if discovery.period not in {"24h", "7d", "30d", "all"}:
         raise SystemExit(
             f"discovery.period must be one of 24h|7d|30d|all, got {discovery.period!r}"
+        )
+    if discovery.score_lookback_hours <= 0:
+        raise SystemExit(
+            f"discovery.score_lookback_hours must be > 0, got {discovery.score_lookback_hours}"
+        )
+    if discovery.min_holding_time_s < 0:
+        raise SystemExit("discovery.min_holding_time_s must be ≥ 0")
+    if not (0.5 <= discovery.min_direction_consistency <= 1.0):
+        raise SystemExit(
+            "discovery.min_direction_consistency must be in [0.5, 1.0] "
+            "(0.5 = even buy/sell mix, 1.0 = pure directional)"
         )
 
     ops_raw = raw.get("ops") or {}
