@@ -225,6 +225,24 @@ class PositionTracker:
             log.warning("Malformed own fill (fields): %s", fill)
             return
 
+        # Skip HL spot-pair fills (`@NNN` or contain `/`). These are stablecoin
+        # swaps and other spot trades — they're EXCHANGES, not positions. If we
+        # tracked them as positions, the inventory would falsely count toward
+        # exposure caps and block legitimate trades. (Real-world bug: a one-time
+        # USDC→USDH swap registered as "@230 short of 54.73" and blocked all
+        # perp mirroring until reconcile.)
+        is_spot_pair = coin.startswith("@") or "/" in coin
+        if is_spot_pair:
+            self.journal.write(
+                "own_fill_skipped",
+                tid=int(tid),
+                coin=coin,
+                reason="spot_pair_not_a_position",
+                sz=sz,
+                px=px,
+            )
+            return
+
         with self._lock:
             inserted = self.state.record_own_fill(
                 tid=int(tid),
