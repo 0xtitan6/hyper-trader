@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from dataclasses import asdict, dataclass, replace
 from threading import Lock
 
@@ -24,6 +25,13 @@ class TradeIntent:
     reduce_only: bool = False
 
 
+# In-flight TTL — how long after submit do we count an order toward exposure
+# before assuming the own-fill WS feedback has updated PositionTracker. Set
+# longer than typical HL WS round-trip (~100-500ms) but short enough that a
+# stuck or rejected order doesn't permanently inflate our exposure estimate.
+IN_FLIGHT_TTL_SECONDS = 30.0
+
+
 class MirrorTrader:
     def __init__(
         self,
@@ -43,6 +51,13 @@ class MirrorTrader:
         # Held across risk-check + submit so two concurrent leader fills can't
         # both pass the exposure cap based on stale state.
         self._submit_lock = Lock()
+        # In-flight orders — pending notional that's been submitted but whose
+        # own-fill confirmation hasn't yet propagated through PositionTracker.
+        # Without this, rapid leader fills bypass `max_total_exposure_usd`
+        # because each new submit's risk check sees stale local position state.
+        # (Real-world bug: 19 fills bypassed a $60 cap and produced a 5x XMR
+        # leverage runaway on 2026-05-05.) Each entry: (expires_at, notional).
+        self._in_flight: list[tuple[float, float]] = []
 
     def on_leader_fill(self, leader: str, fill: dict) -> None:
         tid = fill.get("tid")
@@ -177,6 +192,22 @@ class MirrorTrader:
             or (is_perp and "perp" in allowed)
         )
 
+    def _in_flight_notional(self) -> float:
+        """Sum of in-flight order notionals whose TTL hasn't expired.
+
+        Side-effect: prunes expired entries while iterating. Caller must hold
+        `_submit_lock` (we do — _risk_check is called inside the lock).
+        """
+        now = time.time()
+        active: list[tuple[float, float]] = []
+        total = 0.0
+        for expires_at, notional in self._in_flight:
+            if expires_at > now:
+                active.append((expires_at, notional))
+                total += notional
+        self._in_flight = active
+        return total
+
     def _risk_check(self, intent: TradeIntent) -> tuple[bool, str]:
         r = self.cfg.risk
         if os.path.exists(r.kill_switch_file):
@@ -193,10 +224,16 @@ class MirrorTrader:
             return True, ""
 
         exposure = self.positions.total_exposure_usd()
-        if exposure + intent.notional_usd > r.max_total_exposure_usd:
+        in_flight = self._in_flight_notional()
+        # Total committed exposure = confirmed positions + pending submissions
+        # whose own-fill hasn't propagated through PositionTracker yet. Without
+        # `in_flight`, rapid-fire leader mirrors race the WS feedback loop and
+        # bypass the cap entirely (real bug observed 2026-05-05).
+        committed = exposure + in_flight
+        if committed + intent.notional_usd > r.max_total_exposure_usd:
             return False, (
-                f"exposure_cap (have=${exposure:.0f} + new=${intent.notional_usd:.0f} "
-                f"> ${r.max_total_exposure_usd:.0f})"
+                f"exposure_cap (have=${exposure:.0f} + in_flight=${in_flight:.0f} "
+                f"+ new=${intent.notional_usd:.0f} > ${r.max_total_exposure_usd:.0f})"
             )
         return True, ""
 
@@ -247,6 +284,10 @@ class MirrorTrader:
                 error=str(e),
             )
             raise OrderError(f"order failed: {e}") from e
+        # Track this order's notional as in-flight until own-fill confirms via
+        # PositionTracker. _submit is called inside _submit_lock so it's safe
+        # to mutate _in_flight here without an additional lock acquire.
+        self._in_flight.append((time.time() + IN_FLIGHT_TTL_SECONDS, intent.notional_usd))
         log.info("Order result: %s", result)
         self.journal.write(
             "order_result",
