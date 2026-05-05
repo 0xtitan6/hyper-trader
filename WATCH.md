@@ -38,6 +38,30 @@
 ### Disabled (intentionally)
 - Copy-bot (`src.main`) — leader's edge was on entries (we missed those); mirroring their close-trades opens fresh shorts at fair odds = ~zero EV after fees
 - Endgame strategy (`src.endgame`) — would fail with "Insufficient spot USDH" given current balance
+- Outcome maker (`src.maker`) — built and tested, not deployed yet. Run only on markets with `spread_bps ≥ 30` (default floor) AND with USDH funded.
+
+### Maker module quick-start
+
+```bash
+.venv/bin/python -m src.maker \
+  --coin "#20" \
+  --expiry 2026-05-06T06:00:00+00:00 \
+  --min-spread-bps 30 \
+  --quote-size 1 \
+  --max-position 20 \
+  --max-inventory-usd 5 \
+  --dry-run                # remove for live
+```
+
+Watches the L2 book, posts paired bid/ask quotes (post-only `Alo`) inside the touch with inventory skew, cancels and replaces on mid moves ≥ `cancel_threshold_bps`. **Only quotes when spread ≥ floor — refuses negative-EV markets after fees.** Stops `expiry_buffer_s` (default 300s) before settlement.
+
+**Reading the journal events:**
+- `maker_quote` / `maker_quote_dry` — placed a quote
+- `maker_skip reason=spread_too_tight` — book is tighter than the floor
+- `maker_skip reason=bid_out_of_bounds` — sanity bound suppressed bid
+- `maker_skip reason=quotes_crossed` — math produced bid≥ask, abstained
+- `maker_fill` — our quote got hit (inventory updated)
+- `maker_cancel_all` — cleared all resting orders
 
 ## Standing orders — what to do when
 
@@ -102,4 +126,5 @@ Even if nothing fired since last ping, give a fresh state pull. Don't say "no ch
 
 ## Update log
 
+- **14:10 UTC 2026-05-05** — Maker module shipped (PR pending). Settlement detection + outcome reconcile fix merged (PR #5).
 - **02:46 UTC 2026-05-05** — Created during active BTC binary trade. Position −$5.26, BTC $80,638, 3h 14m to expiry.
