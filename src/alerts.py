@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import threading
 from typing import Protocol
@@ -15,6 +16,7 @@ _LEVEL_LOG = {
     "critical": logging.CRITICAL,
 }
 _QUEUE_MAX = 256
+_TELEGRAM_PREFIX = "https://api.telegram.org/bot"
 
 
 class Alerter(Protocol):
@@ -99,12 +101,33 @@ class WebhookAlerter:
             self._deliver(level, message)
 
     def _deliver(self, level: str, message: str) -> None:
+        """Deliver alert to webhook. Auto-detects URL format:
+        - Telegram bot API: needs `chat_id` + `text` body, chat_id from
+          TELEGRAM_CHAT_ID env. URL pattern: https://api.telegram.org/bot<token>/sendMessage
+        - Slack/Discord/generic: posts {"text": "..."} (the historical default).
+        """
+        formatted = f"[{level.upper()}] {message}"
         try:
-            self._post(  # type: ignore[operator]
-                self.webhook_url,
-                json={"text": f"[{level.upper()}] {message}"},
-                timeout=self.timeout_s,
-            )
+            if self.webhook_url.startswith(_TELEGRAM_PREFIX):
+                chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+                if not chat_id:
+                    log.warning(
+                        "Telegram webhook URL detected but TELEGRAM_CHAT_ID env unset — "
+                        "alert dropped: %s",
+                        formatted,
+                    )
+                    return
+                self._post(  # type: ignore[operator]
+                    self.webhook_url,
+                    json={"chat_id": chat_id, "text": formatted},
+                    timeout=self.timeout_s,
+                )
+            else:
+                self._post(  # type: ignore[operator]
+                    self.webhook_url,
+                    json={"text": formatted},
+                    timeout=self.timeout_s,
+                )
         except Exception:
             log.warning("Failed to deliver alert to webhook", exc_info=True)
 

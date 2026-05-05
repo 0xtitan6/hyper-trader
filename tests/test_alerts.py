@@ -112,6 +112,50 @@ def test_async_drops_when_queue_full(caplog):
         a.stop()
 
 
+def test_telegram_url_uses_chat_id_format(monkeypatch):
+    """Telegram bot API requires chat_id + text (not Slack-style {text:...})."""
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "6576043283")
+    post = MagicMock()
+    url = "https://api.telegram.org/bot12345:abc/sendMessage"
+    a = WebhookAlerter(url, min_level="info", post=post, synchronous=True)
+    a.alert("critical", "settlement -10.25")
+    post.assert_called_once()
+    args, kwargs = post.call_args
+    assert args[0] == url
+    body = kwargs["json"]
+    assert body["chat_id"] == "6576043283"
+    assert "CRITICAL" in body["text"]
+    assert "settlement -10.25" in body["text"]
+    assert "text" in body and len(body) == 2  # Telegram needs both fields
+
+
+def test_telegram_url_drops_alert_when_chat_id_missing(monkeypatch, caplog):
+    """If TELEGRAM_CHAT_ID env is unset, a Telegram URL can't deliver — drop with warning."""
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    post = MagicMock()
+    url = "https://api.telegram.org/bot12345:abc/sendMessage"
+    a = WebhookAlerter(url, min_level="info", post=post, synchronous=True)
+    a.alert("error", "broken")
+    post.assert_not_called()
+    assert any("TELEGRAM_CHAT_ID" in rec.getMessage() for rec in caplog.records), (
+        "expected a warning naming TELEGRAM_CHAT_ID"
+    )
+
+
+def test_non_telegram_url_uses_slack_format(monkeypatch):
+    """Slack/Discord/generic webhooks get the historical {text: ...} body."""
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")  # should be ignored for non-Telegram URLs
+    post = MagicMock()
+    a = WebhookAlerter(
+        "https://hooks.slack.example/abc", min_level="info", post=post, synchronous=True
+    )
+    a.alert("warn", "stale ws")
+    post.assert_called_once()
+    body = post.call_args.kwargs["json"]
+    assert "chat_id" not in body
+    assert body["text"] == "[WARN] stale ws"
+
+
 def test_stop_idempotent_on_null_alerter():
     a = NullAlerter()
     a.stop()
