@@ -63,6 +63,10 @@ Watches the L2 book, posts paired bid/ask quotes (post-only `Alo`) inside the to
 - `maker_fill` — our quote got hit (inventory updated)
 - `maker_cancel_all` — cleared all resting orders
 
+**Risk reference for the maker:** [`docs/HIP4_GREEKS.md`](./docs/HIP4_GREEKS.md) — single-binary Greeks are humped/sign-flipping, NOT vanilla-option-like. Read before lifting `max_inventory_usd`.
+
+**Future direction:** [`docs/HIP4_STRIP_DESIGN.md`](./docs/HIP4_STRIP_DESIGN.md) — design doc for synthesizing vanilla-option-like exposure from binary strips. Build trigger: when HL launches multi-strike outcome ladders.
+
 ## Standing orders — what to do when
 
 ### On any market signal during an open position
@@ -126,5 +130,6 @@ Even if nothing fired since last ping, give a fresh state pull. Don't say "no ch
 
 ## Update log
 
-- **14:10 UTC 2026-05-05** — Maker module shipped (PR pending). Settlement detection + outcome reconcile fix merged (PR #5).
+- **15:50 UTC 2026-05-05** — Added `docs/HIP4_GREEKS.md` (Greeks reference) + `docs/HIP4_STRIP_DESIGN.md` (strip-construction architecture for when HL launches multi-strike ladders). WATCH.md links both under maker section.
+- **14:10 UTC 2026-05-05** — Maker module shipped (PR #6 merged). Settlement detection + outcome reconcile fix merged (PR #5).
 - **02:46 UTC 2026-05-05** — Created during active BTC binary trade. Position −$5.26, BTC $80,638, 3h 14m to expiry.
