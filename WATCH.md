@@ -100,6 +100,22 @@ Even if nothing fired since last ping, give a fresh state pull. Don't say "no ch
 - Trusts but verifies — keep all changes in PRs, no surprise commits to main.
 - Will explicitly approve protocol overrides; defer to that authority once given.
 
+## Lessons learned (live-fire)
+
+These cost real time/money/embarrassment to discover. Don't repeat.
+
+1. **Watcher processes can exit silently.** Symptom: heartbeat stops with no error. Cause uncertain — possibly OOM, possibly killed by sibling pkill. Mitigation: 5-min heartbeat in every monitor; restart if silence >7 min during open position.
+2. **Copy-trading on leader EXITS is structurally near-zero EV.** The leader's edge was at ENTRY (which we missed); their exits are at fair odds. Mirroring opens shorts at no edge, then pays fees. Add open-vs-close detection before re-enabling outcome mirroring at scale.
+3. **Outcome trading requires USDH, not USDC.** And HL auto-dusts non-canonical stables back to USDC unless "Opt Out of Spot Dusting" is enabled in the user's HL settings. Operator must do this manually.
+4. **`Exchange` creates its own internal `Info` instance.** `register_outcome_assets()` MUST run on both the standalone info AND `exchange.info`. Otherwise order placement fails with KeyError.
+5. **Mocked tests don't catch real-API gaps.** The hyperliquid-python-sdk's order tests mock `_post_action`, so the missing HIP-4 coin map was invisible to its CI. Real-API integration tests would have caught it. Keep at least one test that hits live mainnet.
+6. **HL HIP-4 asset ID = 100_000_000 + 10*outcome_id + side.** Not in the upstream Python SDK as of v0.23. Our `src/hl_outcome.py` patches both info instances. Upstream PR draft in `docs/UPSTREAM_HL_SDK_HIP4_PATCH.md`.
+7. **Min outcome order value = $10 USDH.** Below this HL rejects with `"Order must have minimum value of 10 USDH"`. Bot's `outcome_min_per_trade_usd` config field exists for this — set it to 10.
+8. **Agent wallets cannot move funds between perp/spot account classes.** By design. Operator must do `usd_class_transfer` in HL UI. Don't waste time trying to bypass it.
+9. **`@230` is the USDH/USDC spot pair.** Currently ~1:1 with $0.0001 spread. Use this for stablecoin swaps.
+10. **Outcome positions show as `+NN` in `spotClearinghouseState.balances`**, not in `clearinghouseState.assetPositions`. The bot's `PositionTracker.reconcile_with_user_state()` queries the perp side only — outcomes invisible to it. Reconciler will zero "@230" pseudo-positions from spot trades; harmless but noisy.
+
 ## Update log
 
+- **02:54 UTC 2026-05-05** — Added Lessons Learned section after operator request to retain learnings across sessions.
 - **02:46 UTC 2026-05-05** — Created during active BTC binary trade. Position −$5.26, BTC $80,638, 3h 14m to expiry.
