@@ -245,6 +245,23 @@ def test_top_n_plus_always_follow_at_cap_ok(tmp_path, good_env):
     assert len(cfg.discovery.always_follow) == 2
 
 
+def test_always_follow_does_not_clobber_account_address(tmp_path, good_env):
+    """Regression: a previous version of the always_follow validator used
+    `addr` as both the env-var lookup *and* the loop variable, so the
+    final account_address ended up being the last always_follow entry —
+    rerouting bot ops to a leader's wallet. The fix renamed the loop var.
+    """
+    raw = _base_yaml()
+    raw["discovery"]["always_follow"] = [
+        "0x" + "b" * 40,
+        "0x" + "c" * 40,
+        "0x" + "d" * 40,
+    ]
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.account_address == good_env["HL_ACCOUNT_ADDRESS"]
+    assert cfg.account_address != "0x" + "d" * 40
+
+
 def test_negative_ioc_slippage_bps(tmp_path, good_env):
     raw = _base_yaml()
     raw["sizing"]["ioc_slippage_bps"] = -1

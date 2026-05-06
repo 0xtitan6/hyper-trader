@@ -171,12 +171,14 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
             "discovery.top_n must be in [1, 9] — own userFills sub takes 1 of "
             "Hyperliquid's 10 unique-user subs per IP."
         )
-    for addr in discovery.always_follow:
-        if not isinstance(addr, str) or not (
-            addr.startswith("0x") and len(addr) == 42 and all(c in "0123456789abcdefABCDEF" for c in addr[2:])
+    for follow_addr in discovery.always_follow:
+        if not isinstance(follow_addr, str) or not (
+            follow_addr.startswith("0x")
+            and len(follow_addr) == 42
+            and all(c in "0123456789abcdefABCDEF" for c in follow_addr[2:])
         ):
             raise SystemExit(
-                f"discovery.always_follow entry not a valid 0x… address: {addr!r}"
+                f"discovery.always_follow entry not a valid 0x… address: {follow_addr!r}"
             )
     if discovery.top_n + len(discovery.always_follow) > 9:
         raise SystemExit(
