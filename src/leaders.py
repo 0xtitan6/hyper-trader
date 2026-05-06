@@ -61,6 +61,10 @@ def discover_leaders(
                 min_perp_fraction=cfg.min_perp_fraction,
             )
             if ok:
+                if cfg.use_sharpe_weighting:
+                    # clip(sharpe + 1.0, 0.5, 2.0): sharpe 0 → 1.0x (current),
+                    # sharpe 1.0 → 2.0x (cap), sharpe -0.5 → 0.5x (floor).
+                    t.weight = max(0.5, min(2.0, metrics.realized_pnl_sharpe + 1.0))
                 selected.append(t)
                 if len(selected) >= cfg.top_n:
                     break
@@ -86,6 +90,14 @@ def discover_leaders(
             selected.append(forced)
             already.add(addr)
 
+    # Operator-explicit weight overrides take precedence over auto-Sharpe weights.
+    if cfg.leader_weights:
+        weights_by_addr = {a.lower(): w for a, w in cfg.leader_weights.items()}
+        for t in selected:
+            override = weights_by_addr.get(t.address.lower())
+            if override is not None:
+                t.weight = float(override)
+
     if selected:
         log.info(
             "Selected %d/%d leaders (period=%s, quality_filter=%s): %s",
@@ -94,7 +106,8 @@ def discover_leaders(
             cfg.period,
             score_enabled,
             ", ".join(
-                f"{t.address[:10]}…(rank={t.rank}, pnl=${t.pnl:.0f}, trades={t.trades})"
+                f"{t.address[:10]}…(rank={t.rank}, pnl=${t.pnl:.0f}, "
+                f"trades={t.trades}, weight={t.weight:.2f})"
                 for t in selected
             ),
         )

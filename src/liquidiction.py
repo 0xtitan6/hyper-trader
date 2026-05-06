@@ -13,6 +13,11 @@ class Trader:
     pnl: float
     trades: int
     volume: float
+    # Per-leader size multiplier set by `discover_leaders` based on quality
+    # metrics + operator overrides. Default 1.0 = same proportional sizing as
+    # before. Higher = trust this leader more, give them a larger mirror slice
+    # of the same leader notional.
+    weight: float = 1.0
 
 
 class LiquidictionClient:

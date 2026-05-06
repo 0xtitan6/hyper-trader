@@ -142,3 +142,52 @@ def test_always_follow_added_on_top_of_top_n():
     # top 2 from candidates + 1 forced
     assert len(leaders) == 3
     assert "0xrwa" in addrs
+
+
+# ---------- per-leader weight (Sharpe-based + explicit override) ----------
+
+
+def test_default_weight_is_one():
+    """No weight config = every leader keeps default 1.0 weight."""
+    client = MagicMock()
+    client.top_traders.return_value = [_t("0xa", 1, trades=200)]
+    leaders = discover_leaders(client, _disc(top_n=3))
+    assert len(leaders) == 1
+    assert leaders[0].weight == 1.0
+
+
+def test_explicit_leader_weights_override():
+    """leader_weights config sets per-address weight, case-insensitive."""
+    client = MagicMock()
+    client.top_traders.return_value = [_t("0xab", 1, trades=200)]
+    cfg = DiscoveryConfig(
+        period="7d",
+        top_n=3,
+        min_trades=10,
+        min_volume_usd=100,
+        min_pnl_usd=10,
+        refresh_seconds=600,
+        leader_weights={"0xAB": 2.5},  # mixed case key
+    )
+    leaders = discover_leaders(client, cfg)
+    assert leaders[0].weight == 2.5
+
+
+def test_explicit_weight_applies_to_always_follow_synthetic():
+    """always_follow stub gets weight from leader_weights map."""
+    client = MagicMock()
+    client.top_traders.return_value = []
+    cfg = DiscoveryConfig(
+        period="7d",
+        top_n=3,
+        min_trades=10,
+        min_volume_usd=100,
+        min_pnl_usd=10,
+        refresh_seconds=600,
+        always_follow=["0x" + "b" * 40],
+        leader_weights={"0x" + "b" * 40: 3.0},
+    )
+    leaders = discover_leaders(client, cfg)
+    assert len(leaders) == 1
+    assert leaders[0].weight == 3.0
+    assert leaders[0].rank == -1  # was a synthetic stub

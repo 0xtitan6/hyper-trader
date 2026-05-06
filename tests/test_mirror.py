@@ -140,6 +140,69 @@ def test_fixed_sizing_uses_fixed_usd(cfg, positions, journal, alerter, exchange,
     assert sz == 60.0  # 30 / 0.50
 
 
+def test_per_leader_weight_doubles_size(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Leader with weight 2.0 produces 2x the proportional mirror size."""
+    cfg2 = _override_sizing(cfg, max_per_trade_usd=200)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xtrusted": 2.0})
+    # Leader $100 notional x 0.10 prop x 2.0 weight = $20 mirror
+    fill = {"tid": 1, "coin": "#11", "px": "1.0", "sz": "100", "side": "B"}
+    mt.on_leader_fill("0xtrusted", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    assert sz == 20.0  # 20 / 1.0
+
+
+def test_per_leader_weight_halves_size(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Leader with weight 0.5 produces half the proportional mirror size,
+    but still must clear min_per_trade_usd after weighting (min=$1 in cfg)."""
+    cfg2 = _override_sizing(cfg, min_per_trade_usd=1, max_per_trade_usd=200)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xweak": 0.5})
+    # Leader $100 notional x 0.10 prop x 0.5 weight = $5 mirror
+    fill = {"tid": 1, "coin": "#11", "px": "1.0", "sz": "100", "side": "B"}
+    mt.on_leader_fill("0xweak", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    assert sz == 5.0
+
+
+def test_unknown_leader_uses_default_weight(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Leader not in the weight map gets default 1.0 = legacy behavior."""
+    cfg2 = _override_risk(cfg, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xother": 5.0})
+    fill = {"tid": 1, "coin": "#11", "px": "0.50", "sz": "100", "side": "B"}
+    mt.on_leader_fill("0xnotinmap", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    # No weight applied: $50 leader notional x 0.10 = $5 mirror / 0.50 = 10
+    assert sz == 10.0
+
+
+def test_weight_lookup_is_case_insensitive(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Mixed-case leader address still matches a lowercase weight map key."""
+    cfg2 = _override_sizing(cfg, max_per_trade_usd=200)
+    cfg2 = _override_risk(cfg2, dry_run=False)
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xABCDEF": 2.0})  # uppercase set
+    fill = {"tid": 1, "coin": "#11", "px": "1.0", "sz": "100", "side": "B"}
+    mt.on_leader_fill("0xabcdef", fill)  # lowercase callback
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    assert sz == 20.0  # weight applied despite case mismatch
+
+
 def test_malformed_fills_skipped(mt, exchange):
     bad_fills = [
         {"tid": 1},  # missing everything

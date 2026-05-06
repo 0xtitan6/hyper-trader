@@ -147,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     mirror = MirrorTrader(cfg, exchange, positions, journal, alerter, market_meta)
+    mirror.update_leader_weights({t.address: t.weight for t in leaders})
     follower = FillFollower(info, mirror.on_leader_fill, state, health)
     follower.follow([t.address for t in leaders])
     follower_holder["f"] = follower
@@ -178,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                 if added:
                     log.info("Adding %d new leaders to follow set", len(added))
                     follower.follow(sorted(added))
+                mirror.update_leader_weights({t.address: t.weight for t in refreshed})
                 leaders = refreshed
             except Exception:
                 log.exception("Leader refresh failed")

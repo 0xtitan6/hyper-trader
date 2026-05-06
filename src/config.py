@@ -39,6 +39,13 @@ class DiscoveryConfig:
     # real edge in xyz:* names. Counted toward the WS-sub cap:
     # top_n + len(always_follow) ≤ 9.
     always_follow: list[str] = field(default_factory=list)
+    # Per-leader sizing weights. With use_sharpe_weighting=True, each leader's
+    # mirror size is multiplied by clip(sharpe + 1.0, 0.5, 2.0) — so Sharpe 0
+    # → 1.0x (current behavior), Sharpe 1.0 → 2.0x (cap), Sharpe -0.5 → 0.5x.
+    # leader_weights overrides per-address. Useful for always_follow leaders
+    # whose Sharpe wasn't computed inline (synthesized stubs default to 1.0).
+    use_sharpe_weighting: bool = False
+    leader_weights: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -206,6 +213,20 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
             f"discovery.min_perp_fraction must be in [0.0, 1.0], "
             f"got {discovery.min_perp_fraction}"
         )
+    for weight_addr, weight_val in discovery.leader_weights.items():
+        if not isinstance(weight_addr, str) or not (
+            weight_addr.startswith("0x")
+            and len(weight_addr) == 42
+            and all(c in "0123456789abcdefABCDEF" for c in weight_addr[2:])
+        ):
+            raise SystemExit(
+                f"discovery.leader_weights key not a valid 0x… address: {weight_addr!r}"
+            )
+        if not isinstance(weight_val, int | float) or not (0.1 <= float(weight_val) <= 5.0):
+            raise SystemExit(
+                f"discovery.leader_weights[{weight_addr!r}] must be in [0.1, 5.0], "
+                f"got {weight_val!r}"
+            )
 
     ops_raw = raw.get("ops") or {}
     ops = OpsConfig(
