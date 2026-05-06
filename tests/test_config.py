@@ -198,6 +198,70 @@ def test_invalid_ioc_slippage_bps(tmp_path, good_env):
         load_config(_write_yaml(tmp_path, raw), env=good_env)
 
 
+def test_always_follow_valid(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["always_follow"] = ["0x" + "b" * 40]
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.discovery.always_follow == ["0x" + "b" * 40]
+
+
+def test_always_follow_rejects_short_address(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["always_follow"] = ["0xabc"]  # too short
+    with pytest.raises(SystemExit, match="always_follow"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_always_follow_rejects_non_hex(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["always_follow"] = ["0x" + "z" * 40]  # bad hex
+    with pytest.raises(SystemExit, match="always_follow"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_always_follow_rejects_missing_0x(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["always_follow"] = ["b" * 42]
+    with pytest.raises(SystemExit, match="always_follow"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_top_n_plus_always_follow_exceeds_ws_cap(tmp_path, good_env):
+    """top_n=8 + 2 always-follow = 10 — exceeds the 9-sub headroom (own_fills takes 1)."""
+    raw = _base_yaml()
+    raw["discovery"]["top_n"] = 8
+    raw["discovery"]["always_follow"] = ["0x" + "b" * 40, "0x" + "c" * 40]
+    with pytest.raises(SystemExit, match="exceeds HL"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_top_n_plus_always_follow_at_cap_ok(tmp_path, good_env):
+    """top_n=7 + 2 always-follow = 9 — OK, hits the cap exactly."""
+    raw = _base_yaml()
+    raw["discovery"]["top_n"] = 7
+    raw["discovery"]["always_follow"] = ["0x" + "b" * 40, "0x" + "c" * 40]
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.discovery.top_n == 7
+    assert len(cfg.discovery.always_follow) == 2
+
+
+def test_always_follow_does_not_clobber_account_address(tmp_path, good_env):
+    """Regression: a previous version of the always_follow validator used
+    `addr` as both the env-var lookup *and* the loop variable, so the
+    final account_address ended up being the last always_follow entry —
+    rerouting bot ops to a leader's wallet. The fix renamed the loop var.
+    """
+    raw = _base_yaml()
+    raw["discovery"]["always_follow"] = [
+        "0x" + "b" * 40,
+        "0x" + "c" * 40,
+        "0x" + "d" * 40,
+    ]
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.account_address == good_env["HL_ACCOUNT_ADDRESS"]
+    assert cfg.account_address != "0x" + "d" * 40
+
+
 def test_negative_ioc_slippage_bps(tmp_path, good_env):
     raw = _base_yaml()
     raw["sizing"]["ioc_slippage_bps"] = -1
