@@ -13,11 +13,12 @@ from src.leader_score import (
 )
 
 
-def _f(t_ms: int, side: str = "B", closed_pnl: float = 0.0) -> dict:
+def _f(t_ms: int, side: str = "B", closed_pnl: float = 0.0, coin: str = "BTC") -> dict:
     return {
         "time": t_ms,
         "side": side,
         "closedPnl": str(closed_pnl),
+        "coin": coin,
     }
 
 
@@ -170,6 +171,7 @@ def test_quality_pass_for_good_leader():
         time_between_fills_p50_s=600.0,  # 10 min
         direction_consistency=0.7,
         max_drawdown_usd=20.0,
+        perp_fill_fraction=1.0,
     )
     ok, reason = meets_quality(m)
     assert ok is True
@@ -188,6 +190,7 @@ def test_quality_reject_scalper():
         time_between_fills_p50_s=0.5,  # half-second
         direction_consistency=0.6,
         max_drawdown_usd=10.0,
+        perp_fill_fraction=1.0,
     )
     ok, reason = meets_quality(m)
     assert ok is False
@@ -206,6 +209,7 @@ def test_quality_reject_flip_flopper():
         time_between_fills_p50_s=600.0,
         direction_consistency=0.5,  # exact flip
         max_drawdown_usd=20.0,
+        perp_fill_fraction=1.0,
     )
     ok, reason = meets_quality(m)
     assert ok is False
@@ -223,6 +227,7 @@ def test_quality_reject_negative_sharpe():
         time_between_fills_p50_s=600.0,
         direction_consistency=0.7,
         max_drawdown_usd=20.0,
+        perp_fill_fraction=1.0,
     )
     ok, reason = meets_quality(m)
     assert ok is False
@@ -240,6 +245,7 @@ def test_quality_reject_below_min_trades():
         time_between_fills_p50_s=600.0,
         direction_consistency=0.8,
         max_drawdown_usd=10.0,
+        perp_fill_fraction=1.0,
     )
     ok, reason = meets_quality(m)
     assert ok is False
@@ -257,6 +263,7 @@ def test_quality_reject_excess_drawdown():
         time_between_fills_p50_s=600.0,
         direction_consistency=0.7,
         max_drawdown_usd=500.0,
+        perp_fill_fraction=1.0,
     )
     ok, reason = meets_quality(m, max_drawdown_usd=200.0)
     assert ok is False
@@ -275,6 +282,7 @@ def test_quality_thresholds_overridable():
         time_between_fills_p50_s=10.0,  # 10s — would fail default 300s
         direction_consistency=0.6,
         max_drawdown_usd=10.0,
+        perp_fill_fraction=1.0,
     )
     ok_default, _ = meets_quality(m)
     ok_relaxed, _ = meets_quality(m, min_holding_s=5.0)
@@ -318,3 +326,114 @@ def test_load_metrics_happy_path():
     kwargs_payload = info.post.call_args.args[1]
     assert kwargs_payload["type"] == "userFillsByTime"
     assert kwargs_payload["user"] == "0xabc"
+
+
+# ---------- perp_fill_fraction + perp_only scoring ----------
+
+
+def test_perp_fill_fraction_pure_perp():
+    fills = [_f(i * 1000, "B", 1.0, coin="BTC") for i in range(1, 11)]
+    m = _compute_metrics(address="0xabc", lookback_hours=168, fills=fills)
+    assert m.perp_fill_fraction == 1.0
+
+
+def test_perp_fill_fraction_pure_outcome():
+    fills = [_f(i * 1000, "B", 1.0, coin="#31") for i in range(1, 11)]
+    m = _compute_metrics(address="0xabc", lookback_hours=168, fills=fills)
+    assert m.perp_fill_fraction == 0.0
+
+
+def test_perp_fill_fraction_mixed():
+    fills = (
+        [_f(i * 1000, "B", 1.0, coin="BTC") for i in range(1, 7)]  # 6 perp
+        + [_f(i * 1000, "B", 1.0, coin="#31") for i in range(7, 11)]  # 4 outcome
+    )
+    m = _compute_metrics(address="0xabc", lookback_hours=168, fills=fills)
+    assert m.perp_fill_fraction == 0.6
+
+
+def test_perp_fill_fraction_treats_spot_as_non_perp():
+    """`@230` and `USDH/USDC` are spot pairs, not perps."""
+    fills = [
+        _f(1000, "B", 0, coin="BTC"),   # perp
+        _f(2000, "B", 0, coin="@230"),  # spot pair
+        _f(3000, "B", 0, coin="USDH/USDC"),  # spot pair
+    ]
+    m = _compute_metrics(address="0xabc", lookback_hours=168, fills=fills)
+    assert m.perp_fill_fraction == 1 / 3
+
+
+def test_perp_only_excludes_outcome_from_metrics():
+    """With perp_only=True, sharpe/holding/dir come from perp fills only."""
+    # Perp fills: stable +5/+5 → low std (sharpe protected as 0 for std=0)
+    # Outcome fills: -100/+100 → would dominate std and crush Sharpe
+    fills = [
+        _f(1_000_000, "A", 5.0, coin="BTC"),
+        _f(2_000_000, "A", 5.0, coin="BTC"),
+        _f(3_000_000, "A", -100.0, coin="#31"),
+        _f(4_000_000, "A", 100.0, coin="#31"),
+    ]
+    m_full = _compute_metrics(address="0xabc", lookback_hours=168, fills=fills)
+    m_perp = _compute_metrics(
+        address="0xabc", lookback_hours=168, fills=fills, perp_only=True
+    )
+    # Perp-only PnL is just the BTC sum
+    assert m_perp.total_realized_pnl_usd == 10.0
+    assert m_full.total_realized_pnl_usd == 10.0  # net same here
+    # Perp-only closing fills: 2 (BTC). Full: 4 (BTC + #31).
+    assert m_perp.closing_fill_count == 2
+    assert m_full.closing_fill_count == 4
+    # perp_fill_fraction is *always* over the raw universe regardless of mode
+    assert m_perp.perp_fill_fraction == 0.5
+    assert m_full.perp_fill_fraction == 0.5
+
+
+def test_quality_reject_below_min_perp_fraction():
+    m = LeaderMetrics(
+        address="0xoutcomeguy",
+        lookback_hours=168,
+        trade_count=200,
+        closing_fill_count=100,
+        total_realized_pnl_usd=500.0,
+        realized_pnl_sharpe=0.8,
+        time_between_fills_p50_s=600.0,
+        direction_consistency=0.7,
+        max_drawdown_usd=20.0,
+        perp_fill_fraction=0.05,  # 5% perp — overwhelmingly outcome
+    )
+    ok, reason = meets_quality(m, min_perp_fraction=0.5)
+    assert ok is False
+    assert "perp_frac" in reason
+
+
+def test_quality_default_min_perp_fraction_is_zero():
+    """Backward compat: omitting min_perp_fraction never rejects on that axis."""
+    m = LeaderMetrics(
+        address="0xoutcomeguy",
+        lookback_hours=168,
+        trade_count=200,
+        closing_fill_count=100,
+        total_realized_pnl_usd=500.0,
+        realized_pnl_sharpe=0.8,
+        time_between_fills_p50_s=600.0,
+        direction_consistency=0.7,
+        max_drawdown_usd=20.0,
+        perp_fill_fraction=0.0,
+    )
+    ok, _ = meets_quality(m)
+    assert ok is True
+
+
+def test_load_metrics_passes_perp_only():
+    """`perp_only` must reach `_compute_metrics`."""
+    info = MagicMock()
+    info.post.return_value = [
+        _f(1000, "A", 5.0, coin="BTC"),
+        _f(2000, "A", 5.0, coin="BTC"),
+        _f(3000, "A", -10.0, coin="#31"),
+    ]
+    m_full = load_metrics(info, "0xabc", perp_only=False)
+    m_perp = load_metrics(info, "0xabc", perp_only=True)
+    assert m_full is not None and m_perp is not None
+    assert m_full.total_realized_pnl_usd == 0.0  # 5+5-10
+    assert m_perp.total_realized_pnl_usd == 10.0  # perp-only

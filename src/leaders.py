@@ -42,7 +42,12 @@ def discover_leaders(
     if score_enabled:
         assert info is not None  # narrowed by score_enabled
         for t in coarse_filtered:
-            metrics = load_metrics(info, t.address, lookback_hours=cfg.score_lookback_hours)
+            metrics = load_metrics(
+                info,
+                t.address,
+                lookback_hours=cfg.score_lookback_hours,
+                perp_only=cfg.score_perp_only,
+            )
             if metrics is None:
                 rejected_for_score.append((t, "metrics_unavailable"))
                 continue
@@ -53,6 +58,7 @@ def discover_leaders(
                 min_realized_pnl_usd=cfg.min_pnl_usd,
                 min_direction_consistency=cfg.min_direction_consistency,
                 min_trades=cfg.min_trades,
+                min_perp_fraction=cfg.min_perp_fraction,
             )
             if ok:
                 selected.append(t)

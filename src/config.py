@@ -24,6 +24,14 @@ class DiscoveryConfig:
     min_holding_time_s: float = 300.0  # 5 min — reject sub-second scalpers
     min_sharpe: float = 0.0  # only reject negative Sharpe by default
     min_direction_consistency: float = 0.55  # reject pure flip-flop (0.5 = even split)
+    # Perp-bias screening: 2026-05-06 we found the HL leaderboard is dominated
+    # by HIP-4 outcome traders, so a perp-only mirror watches them fire and
+    # skips every fill. score_perp_only re-computes Sharpe/holding/direction
+    # using perp fills only (outcome activity excluded — different timing).
+    # min_perp_fraction additionally requires the leader's full fill universe
+    # to be ≥ N% perp. Both default to 0/False to preserve old behavior.
+    score_perp_only: bool = False
+    min_perp_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -170,6 +178,11 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
         raise SystemExit(
             "discovery.min_direction_consistency must be in [0.5, 1.0] "
             "(0.5 = even buy/sell mix, 1.0 = pure directional)"
+        )
+    if not (0.0 <= discovery.min_perp_fraction <= 1.0):
+        raise SystemExit(
+            f"discovery.min_perp_fraction must be in [0.0, 1.0], "
+            f"got {discovery.min_perp_fraction}"
         )
 
     ops_raw = raw.get("ops") or {}
