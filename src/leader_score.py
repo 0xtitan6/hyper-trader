@@ -48,9 +48,24 @@ from .protocols import InfoProto
 log = logging.getLogger(__name__)
 
 
+def _is_perp_coin(coin: str) -> bool:
+    """Mirror src/mirror.py's classification: perp = not outcome and not spot."""
+    if not coin:
+        return False
+    is_outcome = coin.startswith("#") or coin.startswith("+")
+    is_spot = coin.startswith("@") or "/" in coin
+    return not (is_outcome or is_spot)
+
+
 @dataclass(frozen=True)
 class LeaderMetrics:
-    """Quality metrics for a single leader address over a lookback window."""
+    """Quality metrics for a single leader address over a lookback window.
+
+    When `perp_only=True` is passed to `_compute_metrics`, the time/sharpe/dir
+    fields reflect only perp fills — useful for screening leaders for a
+    perp-only mirror (their portfolio Sharpe gets diluted by HIP-4 outcomes).
+    `perp_fill_fraction` is always computed over raw fills.
+    """
 
     address: str
     lookback_hours: float
@@ -61,14 +76,20 @@ class LeaderMetrics:
     time_between_fills_p50_s: float  # median seconds between consecutive fills
     direction_consistency: float  # 0.5 = perfectly mixed, 1.0 = pure directional
     max_drawdown_usd: float  # worst peak-to-trough drawdown
+    perp_fill_fraction: float  # fraction of all fills on perp markets (always raw)
 
 
 def load_metrics(
-    info: InfoProto, address: str, lookback_hours: float = 168.0
+    info: InfoProto,
+    address: str,
+    lookback_hours: float = 168.0,
+    perp_only: bool = False,
 ) -> LeaderMetrics | None:
     """Fetch fills for `address` over the last `lookback_hours` and compute metrics.
 
-    Returns None on fetch failure or insufficient data.
+    `perp_only=True` restricts time/sharpe/direction/drawdown computations to
+    perp fills only, while `perp_fill_fraction` always reflects the full fill
+    universe. Returns None on fetch failure or unparseable response.
     """
     since_ms = int((time.time() - lookback_hours * 3600) * 1000)
     try:
@@ -81,15 +102,32 @@ def load_metrics(
         return None
     if not isinstance(fills, list):
         return None
-    return _compute_metrics(address=address, lookback_hours=lookback_hours, fills=fills)
+    return _compute_metrics(
+        address=address, lookback_hours=lookback_hours, fills=fills, perp_only=perp_only
+    )
 
 
 def _compute_metrics(
-    *, address: str, lookback_hours: float, fills: list[dict[str, Any]]
+    *,
+    address: str,
+    lookback_hours: float,
+    fills: list[dict[str, Any]],
+    perp_only: bool = False,
 ) -> LeaderMetrics:
     """Pure metric computation (no I/O). Public for testing."""
     if not fills:
         return _empty(address, lookback_hours)
+
+    # First pass: count perp vs total over all parseable fills, regardless of mode.
+    raw_total = 0
+    raw_perp = 0
+    for f in fills:
+        if not isinstance(f, dict):
+            continue
+        raw_total += 1
+        if _is_perp_coin(f.get("coin", "")):
+            raw_perp += 1
+    perp_fill_fraction = raw_perp / raw_total if raw_total > 0 else 0.0
 
     times: list[int] = []
     closed_pnls: list[float] = []
@@ -98,6 +136,8 @@ def _compute_metrics(
 
     for f in fills:
         if not isinstance(f, dict):
+            continue
+        if perp_only and not _is_perp_coin(f.get("coin", "")):
             continue
         try:
             t = int(f.get("time", 0))
@@ -161,6 +201,7 @@ def _compute_metrics(
         time_between_fills_p50_s=p50,
         direction_consistency=consistency,
         max_drawdown_usd=max_dd,
+        perp_fill_fraction=perp_fill_fraction,
     )
 
 
@@ -175,6 +216,7 @@ def _empty(address: str, lookback_hours: float) -> LeaderMetrics:
         time_between_fills_p50_s=0.0,
         direction_consistency=0.0,
         max_drawdown_usd=0.0,
+        perp_fill_fraction=0.0,
     )
 
 
@@ -187,10 +229,15 @@ def meets_quality(
     min_direction_consistency: float = 0.55,  # reject pure flip-flop
     min_trades: int = 10,
     max_drawdown_usd: float = math.inf,
+    min_perp_fraction: float = 0.0,  # require N% of fills be on perp markets
 ) -> tuple[bool, str]:
     """Threshold filter. Returns (ok, reason). `reason` is empty when ok=True."""
     if m.trade_count < min_trades:
         return False, f"trades={m.trade_count} < {min_trades}"
+    if m.perp_fill_fraction < min_perp_fraction:
+        return False, (
+            f"perp_frac={m.perp_fill_fraction:.2f} < {min_perp_fraction:.2f}"
+        )
     if m.time_between_fills_p50_s < min_holding_s:
         return False, (f"holding_p50={m.time_between_fills_p50_s:.0f}s < {min_holding_s:.0f}s")
     if m.realized_pnl_sharpe < min_sharpe:
