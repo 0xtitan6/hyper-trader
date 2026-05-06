@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -32,6 +32,13 @@ class DiscoveryConfig:
     # to be ≥ N% perp. Both default to 0/False to preserve old behavior.
     score_perp_only: bool = False
     min_perp_fraction: float = 0.0
+    # Operator override: hex addresses to follow regardless of leaderboard
+    # rank or quality filter. Bypasses every coarse + score filter. Useful
+    # for specialists auto-discovery rejects — e.g. RWA-heavy traders whose
+    # tokenized-stock activity makes them fail perp_fraction but who have a
+    # real edge in xyz:* names. Counted toward the WS-sub cap:
+    # top_n + len(always_follow) ≤ 9.
+    always_follow: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -163,6 +170,19 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
         raise SystemExit(
             "discovery.top_n must be in [1, 9] — own userFills sub takes 1 of "
             "Hyperliquid's 10 unique-user subs per IP."
+        )
+    for addr in discovery.always_follow:
+        if not isinstance(addr, str) or not (
+            addr.startswith("0x") and len(addr) == 42 and all(c in "0123456789abcdefABCDEF" for c in addr[2:])
+        ):
+            raise SystemExit(
+                f"discovery.always_follow entry not a valid 0x… address: {addr!r}"
+            )
+    if discovery.top_n + len(discovery.always_follow) > 9:
+        raise SystemExit(
+            f"discovery.top_n ({discovery.top_n}) + len(always_follow) "
+            f"({len(discovery.always_follow)}) > 9 — exceeds HL's 10-sub cap "
+            f"per IP (own userFills sub takes 1)."
         )
     if discovery.period not in {"24h", "7d", "30d", "all"}:
         raise SystemExit(

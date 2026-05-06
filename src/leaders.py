@@ -69,6 +69,23 @@ def discover_leaders(
     else:
         selected = coarse_filtered[: cfg.top_n]
 
+    # Operator override: append `always_follow` addresses regardless of any
+    # filter outcome above. If the address is in the candidates pool we use
+    # the real Trader record; otherwise we synthesize a minimal one (the
+    # downstream FillFollower only needs the address).
+    if cfg.always_follow:
+        already = {t.address.lower() for t in selected}
+        by_addr = {t.address.lower(): t for t in candidates}
+        for raw in cfg.always_follow:
+            addr = raw.lower()
+            if addr in already:
+                continue
+            forced = by_addr.get(addr) or Trader(
+                address=addr, rank=-1, pnl=0.0, trades=0, volume=0.0
+            )
+            selected.append(forced)
+            already.add(addr)
+
     if selected:
         log.info(
             "Selected %d/%d leaders (period=%s, quality_filter=%s): %s",
