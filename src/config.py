@@ -61,6 +61,17 @@ class SizingConfig:
     # smaller. Setting outcome_min_per_trade_usd separately lets perp trades
     # mirror at small sizes without blocking outcome attempts.
     outcome_min_per_trade_usd: float | None = None
+    # Funding-aware sizing (PR #19): adjusts perp mirror size by current
+    # funding rate. When we'd GET PAID funding (e.g. shorting an asset with
+    # positive APR funding), size scales up by min(1 + apr/200, amplify_cap).
+    # When we'd PAY funding above skip_threshold, the trade is skipped
+    # entirely (the funding cost would dominate any leader edge over our
+    # typical hold time). Outcomes have no continuous funding so this only
+    # affects perp fills.
+    use_funding_aware_sizing: bool = False
+    funding_amplify_threshold_apr_pct: float = 20.0  # below: no boost
+    funding_amplify_cap: float = 1.5  # max 1.5x size on extreme positive funding
+    funding_skip_threshold_apr_pct: float = 100.0  # above adverse APR: skip
 
 
 @dataclass(frozen=True)
@@ -163,6 +174,16 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
                 "sizing.outcome_min_per_trade_usd > max_per_trade_usd "
                 "— outcome trades would always be rejected"
             )
+    if sizing.funding_amplify_threshold_apr_pct < 0:
+        raise SystemExit("sizing.funding_amplify_threshold_apr_pct must be ≥ 0")
+    if not (1.0 <= sizing.funding_amplify_cap <= 5.0):
+        raise SystemExit(
+            f"sizing.funding_amplify_cap must be in [1.0, 5.0], got {sizing.funding_amplify_cap}"
+        )
+    if sizing.funding_skip_threshold_apr_pct < sizing.funding_amplify_threshold_apr_pct:
+        raise SystemExit(
+            "sizing.funding_skip_threshold_apr_pct must be ≥ funding_amplify_threshold_apr_pct"
+        )
 
     risk = RiskConfig(**raw["risk"])
     valid_markets = {"outcome", "perp", "spot"}
