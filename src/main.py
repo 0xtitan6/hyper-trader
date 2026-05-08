@@ -14,6 +14,7 @@ from .config import Config, load_config
 from .connection import ConnectionHealth
 from .errors import PreflightError
 from .follower import FillFollower
+from .funding import FundingTracker
 from .hl_outcome import register_outcome_assets
 from .journal import Journal
 from .leaders import discover_leaders
@@ -146,7 +147,14 @@ def main(argv: list[str] | None = None) -> int:
         f"dry_run={cfg.risk.dry_run} leaders={len(leaders)}",
     )
 
-    mirror = MirrorTrader(cfg, exchange, positions, journal, alerter, market_meta)
+    funding = FundingTracker(info)
+    if cfg.sizing.use_funding_aware_sizing:
+        n_funded = funding.refresh()
+        log.info("FundingTracker primed with %d perp rates", n_funded)
+
+    mirror = MirrorTrader(
+        cfg, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
     mirror.update_leader_weights({t.address: t.weight for t in leaders})
     follower = FillFollower(info, mirror.on_leader_fill, state, health)
     follower.follow([t.address for t in leaders])
@@ -180,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
                     log.info("Adding %d new leaders to follow set", len(added))
                     follower.follow(sorted(added))
                 mirror.update_leader_weights({t.address: t.weight for t in refreshed})
+                if cfg.sizing.use_funding_aware_sizing:
+                    funding.refresh()
                 leaders = refreshed
             except Exception:
                 log.exception("Leader refresh failed")

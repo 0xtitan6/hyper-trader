@@ -7,6 +7,7 @@ from threading import Lock
 from .alerts import Alerter
 from .config import Config
 from .errors import OrderError
+from .funding import FundingTracker
 from .journal import Journal
 from .market_meta import MarketMeta
 from .positions import PositionTracker
@@ -41,6 +42,7 @@ class MirrorTrader:
         journal: Journal,
         alerter: Alerter,
         market_meta: MarketMeta,
+        funding: FundingTracker | None = None,
     ):
         self.cfg = cfg
         self.exchange = exchange
@@ -48,6 +50,7 @@ class MirrorTrader:
         self.journal = journal
         self.alerter = alerter
         self.market_meta = market_meta
+        self.funding = funding  # None = funding-aware sizing disabled
         # Held across risk-check + submit so two concurrent leader fills can't
         # both pass the exposure cap based on stale state.
         self._submit_lock = Lock()
@@ -155,6 +158,27 @@ class MirrorTrader:
             if is_outcome and s.outcome_min_per_trade_usd is not None
             else s.min_per_trade_usd
         )
+
+        # Funding-aware sizing (perps only — outcomes settle at expiry, no funding).
+        # Apply BEFORE the max_per_trade cap so amplification still respects it.
+        if (
+            s.use_funding_aware_sizing
+            and self.funding is not None
+            and not is_outcome
+        ):
+            apr_pct = self.funding.get_apr_pct(coin)
+            if apr_pct is not None:
+                # Convention: APR > 0 means longs PAY shorts (i.e. shorts get paid).
+                # we_get_paid_apr = +apr if short, -apr if long.
+                we_get_paid_apr = -apr_pct if is_buy else apr_pct
+                if we_get_paid_apr <= -s.funding_skip_threshold_apr_pct:
+                    # Adverse funding too costly — skip the mirror entirely.
+                    return None
+                if we_get_paid_apr >= s.funding_amplify_threshold_apr_pct:
+                    # Linear ramp: at threshold → 1.0x, scaled up to amplify_cap
+                    # at +200% APR. Capped at amplify_cap.
+                    raw_mult = 1.0 + (we_get_paid_apr / 200.0)
+                    mirror_notional *= min(raw_mult, s.funding_amplify_cap)
 
         mirror_notional = min(mirror_notional, s.max_per_trade_usd)
         if mirror_notional < effective_min:

@@ -203,6 +203,158 @@ def test_weight_lookup_is_case_insensitive(
     assert sz == 20.0  # weight applied despite case mismatch
 
 
+# ---------- funding-aware sizing ----------
+
+
+def _funding_stub(apr_map: dict[str, float]):
+    """Build a FundingTracker-like stub returning apr_pct from a dict."""
+    stub = MagicMock()
+    stub.get_apr_pct.side_effect = lambda c: apr_map.get(c)
+    return stub
+
+
+def test_funding_amplifies_short_when_funding_positive(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Shorting an asset with +50% APR funding (we get paid) → size boost."""
+    cfg2 = _override_sizing(
+        cfg,
+        max_per_trade_usd=200,
+        use_funding_aware_sizing=True,
+        funding_amplify_threshold_apr_pct=20.0,
+        funding_amplify_cap=1.5,
+        funding_skip_threshold_apr_pct=200.0,
+    )
+    cfg2 = _override_risk(cfg2, dry_run=False, allowed_market_types=["perp"])
+    funding = _funding_stub({"BTC": 50.0})
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    # Leader sells (short) BTC: $1000 leader notional x 0.10 = $100
+    # we_get_paid_apr = +50, raw_mult = 1 + 50/200 = 1.25 → $125 mirror
+    fill = {"tid": 1, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleader", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    assert abs(sz - 1.25) < 1e-9  # 125 / 100 = 1.25
+
+
+def test_funding_amplification_clipped_by_cap(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Extreme positive funding still respects funding_amplify_cap."""
+    cfg2 = _override_sizing(
+        cfg,
+        max_per_trade_usd=500,
+        use_funding_aware_sizing=True,
+        funding_amplify_threshold_apr_pct=20.0,
+        funding_amplify_cap=1.5,
+        funding_skip_threshold_apr_pct=1000.0,  # don't skip
+    )
+    cfg2 = _override_risk(cfg2, dry_run=False, allowed_market_types=["perp"])
+    funding = _funding_stub({"BTC": 400.0})  # 400% APR — would scale to 3.0x raw
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    fill = {"tid": 1, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}  # short
+    mt.on_leader_fill("0xleader", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    assert abs(sz - 1.5) < 1e-9  # 100 * 1.5 cap = 150 / 100
+
+
+def test_funding_skips_when_adverse_above_threshold(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Longing an asset with +200% APR (we PAY 200% APR) → trade skipped."""
+    cfg2 = _override_sizing(
+        cfg,
+        use_funding_aware_sizing=True,
+        funding_skip_threshold_apr_pct=100.0,
+    )
+    cfg2 = _override_risk(cfg2, dry_run=False, allowed_market_types=["perp"])
+    funding = _funding_stub({"BTC": 200.0})
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    fill = {"tid": 1, "coin": "BTC", "px": "100", "sz": "10", "side": "B"}  # long
+    mt.on_leader_fill("0xleader", fill)
+    exchange.order.assert_not_called()
+
+
+def test_funding_no_effect_below_threshold(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """APR below amplify_threshold and above skip_threshold = no size change."""
+    cfg2 = _override_sizing(
+        cfg,
+        use_funding_aware_sizing=True,
+        funding_amplify_threshold_apr_pct=20.0,
+        funding_skip_threshold_apr_pct=100.0,
+    )
+    cfg2 = _override_risk(cfg2, dry_run=False, allowed_market_types=["perp"])
+    funding = _funding_stub({"BTC": 5.0})  # tiny funding, well within "do nothing"
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    fill = {"tid": 1, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleader", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    # No funding adjustment: $1000 x 0.10 = $100 / 100 = 1.0 sz
+    assert abs(sz - 1.0) < 1e-9
+
+
+def test_funding_skip_when_we_pay_extreme(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Shorting an asset with -120% APR funding (we'd PAY) → skip."""
+    cfg2 = _override_sizing(
+        cfg,
+        use_funding_aware_sizing=True,
+        funding_skip_threshold_apr_pct=100.0,
+    )
+    cfg2 = _override_risk(cfg2, dry_run=False, allowed_market_types=["perp"])
+    funding = _funding_stub({"STABLE": -120.0})  # short would PAY 120% APR
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    fill = {"tid": 1, "coin": "STABLE", "px": "0.05", "sz": "1000", "side": "A"}
+    mt.on_leader_fill("0xleader", fill)
+    exchange.order.assert_not_called()
+
+
+def test_funding_disabled_when_flag_off(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """use_funding_aware_sizing=False → no adjustment regardless of funding."""
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    funding = _funding_stub({"BTC": 500.0})  # extreme but should be ignored
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    fill = {"tid": 1, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleader", fill)
+    args, _ = exchange.order.call_args
+    sz = args[2]
+    assert abs(sz - 1.0) < 1e-9  # no amplification
+
+
+def test_funding_does_not_affect_outcome_trades(
+    cfg, positions, journal, alerter, exchange, market_meta
+):
+    """Outcomes don't have funding — funding-aware sizing must not touch them."""
+    cfg2 = _override_sizing(cfg, use_funding_aware_sizing=True)
+    cfg2 = _override_risk(cfg2, dry_run=False)  # outcome allowed by default
+    funding = _funding_stub({})  # no entry for outcomes; would return None anyway
+    mt = MirrorTrader(
+        cfg2, exchange, positions, journal, alerter, market_meta, funding=funding
+    )
+    fill = {"tid": 1, "coin": "#11", "px": "0.54", "sz": "100", "side": "B"}
+    mt.on_leader_fill("0xleader", fill)
+    exchange.order.assert_called_once()
+
+
 def test_malformed_fills_skipped(mt, exchange):
     bad_fills = [
         {"tid": 1},  # missing everything
