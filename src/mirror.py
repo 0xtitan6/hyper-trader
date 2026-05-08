@@ -58,6 +58,18 @@ class MirrorTrader:
         # (Real-world bug: 19 fills bypassed a $60 cap and produced a 5x XMR
         # leverage runaway on 2026-05-05.) Each entry: (expires_at, notional).
         self._in_flight: list[tuple[float, float]] = []
+        # Per-leader sizing weight, refreshed every discover_leaders cycle.
+        # Default 1.0 = original proportional sizing. Updated via
+        # update_leader_weights() from main's refresh loop.
+        self._leader_weights: dict[str, float] = {}
+
+    def update_leader_weights(self, weights: dict[str, float]) -> None:
+        """Replace the per-leader weight map (called after each leader refresh).
+
+        Keys are lowercase address strings; values are size multipliers in [0.1, 5.0].
+        Missing leaders default to 1.0 in `_build_intent`.
+        """
+        self._leader_weights = {a.lower(): float(w) for a, w in weights.items()}
 
     def on_leader_fill(self, leader: str, fill: dict) -> None:
         tid = fill.get("tid")
@@ -71,7 +83,7 @@ class MirrorTrader:
                 sz=fill.get("sz"),
                 side=fill.get("side"),
             )
-            intent = self._build_intent(fill)
+            intent = self._build_intent(fill, leader)
             if intent is None:
                 self.journal.write("intent_skipped", leader=leader, tid=tid, reason="filter")
                 return
@@ -111,7 +123,7 @@ class MirrorTrader:
             if isinstance(tid, int):
                 self.positions.state.unmark_tid_seen(tid)
 
-    def _build_intent(self, fill: dict) -> TradeIntent | None:
+    def _build_intent(self, fill: dict, leader: str = "") -> TradeIntent | None:
         coin = fill.get("coin")
         try:
             px = float(fill.get("px", 0))
@@ -127,10 +139,11 @@ class MirrorTrader:
         is_buy = side == "B"
         leader_notional = px * sz
         s = self.cfg.sizing
+        weight = self._leader_weights.get(leader.lower(), 1.0) if leader else 1.0
         if s.mode == "proportional":
-            mirror_notional = leader_notional * s.proportional_fraction
+            mirror_notional = leader_notional * s.proportional_fraction * weight
         elif s.mode == "fixed":
-            mirror_notional = float(s.fixed_usd)
+            mirror_notional = float(s.fixed_usd) * weight
         else:
             return None
 

@@ -262,6 +262,34 @@ def test_always_follow_does_not_clobber_account_address(tmp_path, good_env):
     assert cfg.account_address != "0x" + "d" * 40
 
 
+def test_leader_weights_valid(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["leader_weights"] = {"0x" + "b" * 40: 2.0}
+    cfg = load_config(_write_yaml(tmp_path, raw), env=good_env)
+    assert cfg.discovery.leader_weights == {"0x" + "b" * 40: 2.0}
+
+
+def test_leader_weights_rejects_bad_address(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["leader_weights"] = {"not-an-addr": 2.0}
+    with pytest.raises(SystemExit, match="leader_weights"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_leader_weights_rejects_out_of_range(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["leader_weights"] = {"0x" + "b" * 40: 10.0}  # > 5.0 cap
+    with pytest.raises(SystemExit, match="leader_weights"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
+def test_leader_weights_rejects_negative(tmp_path, good_env):
+    raw = _base_yaml()
+    raw["discovery"]["leader_weights"] = {"0x" + "b" * 40: -1.0}
+    with pytest.raises(SystemExit, match="leader_weights"):
+        load_config(_write_yaml(tmp_path, raw), env=good_env)
+
+
 def test_negative_ioc_slippage_bps(tmp_path, good_env):
     raw = _base_yaml()
     raw["sizing"]["ioc_slippage_bps"] = -1
