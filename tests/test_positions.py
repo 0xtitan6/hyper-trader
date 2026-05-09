@@ -472,3 +472,39 @@ def test_reconcile_journals_event(state, journal, tmp_path):
     reconcile_events = [e for e in lines if e["event"] == "reconcile"]
     assert len(reconcile_events) == 1
     assert "#stale" in reconcile_events[0]["zeroed"]
+
+
+def test_reconcile_skips_already_closed_positions_in_journal(state, journal, tmp_path):
+    """Regression: closed (sz=0) positions stayed in state.db and got listed in
+    every reconcile journal entry's `zeroed` field, plus inflated `local_count`,
+    even though they were already zero. Caught 2026-05-09 by the supervisor cron
+    after a single bot run accumulated 9 phantoms over 4 days. Fix: filter
+    sz=0 entries out of the comparison/journal before computing diffs."""
+    # 1 active + 3 already-closed positions
+    state.update_position("#11", 50.0, 0.40)
+    state.update_position("#closed1", 0.0, 0.0)
+    state.update_position("#closed2", 0.0, 0.0)
+    state.update_position("HYPE", 0.0, 0.0)
+
+    info = MagicMock()
+    info.user_state.return_value = {
+        "assetPositions": [
+            {"position": {"coin": "#11", "szi": "50", "entryPx": "0.40"}},
+        ]
+    }
+    pt = PositionTracker(info, "0xacc", state, journal)
+    pt.reconcile_with_user_state()
+
+    import json
+
+    with open(journal.path) as f:
+        lines = [json.loads(line) for line in f]
+    reconcile_events = [e for e in lines if e["event"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    ev = reconcile_events[0]
+    # local_count should be 1 (just #11), NOT 4 (which would include the 3 phantoms)
+    assert ev["local_count"] == 1
+    # zeroed should be empty — closed positions don't need re-zeroing
+    assert ev["zeroed"] == []
+    # The state.db rows still exist (we don't delete on reconcile, just skip)
+    assert state.get_position("#closed1") == (0.0, 0.0)
