@@ -187,6 +187,28 @@ The paper's directly-applicable subset for our surface:
 
 ---
 
+## Reference architectures
+
+### QuantAgent — multi-agent LLM trading framework
+**What:** Academic multi-agent system (Stony Brook + CMU + UBC + Yale + Fudan, 2025; arXiv 2509.09995). Four specialized LangChain/LangGraph agents (Indicator → Pattern → Trend → Decision) that read OHLC data and output trade directives. Repo: <https://github.com/Y-Research-SBU/QuantAgent>.
+
+**Why it's relevant as a reference:** The multi-agent decomposition pattern (specialized analysis agents + a synthesis/decision agent) is structurally what an eventual MCP-mediated supervisor over hyper-trader should look like. Useful template for HOW to structure the supervisor when we get there.
+
+**Why it's NOT a direct code drop:**
+- Doesn't execute trades — generates recommendations only.
+- Uses yfinance, not HL tick feeds.
+- 30-candlestick window is tiny for our timescale.
+- LLM agents have 1-3s latency — incompatible with mirror's 50-200ms reflex-level response.
+- Research prototype, no benchmarks or live validation in the repo.
+
+**Where it'd fit (in our system):** A SUPERVISOR layer that runs every N minutes, evaluates whether recent bot trades fit broader context, surfaces concerns to the operator. Slow + deliberate, complementary to the fast bot. Composes with `RESEARCH_BACKLOG.md → MCP read-only data layer` — the MCP servers expose data; QuantAgent-style multi-agent decomposition is HOW to consume it.
+
+**Stage gate:** Stage 3+. Needs the MCP layer first (Stage 2), and a strategy worth supervising (Stage 3+).
+
+**Engineering estimate:** Adapt rather than fork. 1-2 weeks for a supervisor that uses our MCP servers + LangGraph agent decomposition for periodic strategy review.
+
+---
+
 ## Cross-platform expansion
 
 ### Polymarket-MM activation
