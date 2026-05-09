@@ -143,9 +143,16 @@ class PositionTracker:
             upstream[trade_coin] = (total, avg_px)
 
         local = self.state.get_positions()
+        # Filter out already-closed positions (sz=0) from comparison/journal
+        # entries — they are historical artifacts, not phantom positions
+        # needing reconciliation. Without this filter, every reconcile cycle
+        # logs the same closed-coin set in `zeroed` even though no mutation
+        # happens (caught by supervisor 2026-05-09: 9 phantoms re-listed every
+        # 5 min for 24+ hours straight).
+        active_local = {coin: pos for coin, pos in local.items() if pos[0] != 0}
         with self._lock:
             for coin, (sz, avg_px) in upstream.items():
-                cur = local.get(coin)
+                cur = active_local.get(coin)
                 if cur != (sz, avg_px):
                     log.info(
                         "reconcile: %s local=%s upstream=(%s,%s)",
@@ -155,16 +162,15 @@ class PositionTracker:
                         avg_px,
                     )
                 self.state.update_position(coin, sz, avg_px)
-            for coin in local.keys() - upstream.keys():
-                cur_sz, _cur_avg = local[coin]
-                if cur_sz != 0:
-                    log.info("reconcile: zeroing %s (was sz=%s)", coin, cur_sz)
-                    self.state.update_position(coin, 0.0, 0.0)
+            for coin in active_local.keys() - upstream.keys():
+                cur_sz, _cur_avg = active_local[coin]
+                log.info("reconcile: zeroing %s (was sz=%s)", coin, cur_sz)
+                self.state.update_position(coin, 0.0, 0.0)
         self.journal.write(
             "reconcile",
             upstream_count=len(upstream),
-            local_count=len(local),
-            zeroed=sorted(local.keys() - upstream.keys()),
+            local_count=len(active_local),
+            zeroed=sorted(active_local.keys() - upstream.keys()),
         )
         return self.state.get_positions()
 
