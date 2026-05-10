@@ -72,8 +72,13 @@ class ConnectionHealth:
                 self._was_stale = True
             if not fire:
                 continue
+            # WS stale is routine — HL drops connections every ~30 min and bot
+            # reconnects + backfills automatically. Demoted from "error" to
+            # "warn" 2026-05-10 because the bot's alert-path going live made
+            # these spam visible. Real prolonged disconnects (>5 min) trigger
+            # this; routine cycles don't (threshold raised to 300s in config).
             self.alerter.alert(
-                "error",
+                "warn",
                 f"WS stale: no messages in {age:.0f}s (threshold {self.stale_threshold_s:.0f}s)",
             )
             if self.on_stale is not None:
