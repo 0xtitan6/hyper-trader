@@ -97,6 +97,23 @@ class MirrorTrader:
                     intent,
                     reduce_only=self._is_reduce_only(intent.coin, intent.is_buy, intent.sz),
                 )
+                # Per-coin weight-priority conflict lock (PR #25). Caught
+                # 2026-05-10: two leaders took opposite sides on TON within
+                # 30 min and we whipsawed -$1.85 across both legs. Rule:
+                # if our existing position on this coin was opened by a
+                # different leader AND new fill is opposite-direction AND
+                # current leader has lower weight than originator → skip.
+                conflict_reason = self._check_leader_conflict(intent, leader)
+                if conflict_reason is not None:
+                    log.info(
+                        "[conflict] skip leader=%s coin=%s reason=%s",
+                        leader[:10], intent.coin, conflict_reason,
+                    )
+                    self.journal.write(
+                        "intent_skipped", leader=leader, tid=tid,
+                        reason=f"leader_conflict:{conflict_reason}",
+                    )
+                    return
                 ok, reason = self._risk_check(intent)
                 self.journal.write(
                     "risk_check",
@@ -112,6 +129,9 @@ class MirrorTrader:
                     )
                     return
                 self._submit(intent, leader, tid)
+                # Record this leader as the position's originator. Done
+                # post-submit so a failed order doesn't claim the coin.
+                self.positions.state.set_position_originator(intent.coin, leader)
         except OrderError:
             raise
         except Exception:
@@ -203,6 +223,51 @@ class MirrorTrader:
             limit_px=rounded_px,
             notional_usd=rounded_notional,
             reduce_only=False,
+        )
+
+    def _check_leader_conflict(self, intent: TradeIntent, leader: str) -> str | None:
+        """Per-coin weight-priority conflict check.
+
+        Returns None if the trade is allowed, or a string reason if it should
+        be skipped because a different (higher-weight) leader already holds
+        a position on this coin in the opposite direction.
+
+        Rules:
+          1. No existing position → allow (this leader becomes originator)
+          2. Existing position from same leader → allow (they're managing it)
+          3. Existing position from different leader, same direction → allow
+             (we're adding to position they opened; benign)
+          4. Existing position from different leader, OPPOSITE direction
+             AND new leader weight ≤ originator weight → SKIP (conflict)
+          5. Same as (4) but new leader has STRICTLY higher weight → allow
+             (override based on conviction)
+        """
+        existing_sz, _ = self.positions.state.get_position(intent.coin)
+        if existing_sz == 0:
+            return None  # rule 1
+        originator = self.positions.state.get_position_originator(intent.coin)
+        # Treat anything that isn't a real address string as "unset" — covers
+        # pre-PR-#25 positions migrated without an originator AND defends
+        # against mock-test environments returning unexpected types.
+        if not isinstance(originator, str) or not originator:
+            return None
+        if originator == leader.lower():
+            return None  # rule 2: same leader managing their own position
+        # Different leader. Is the new fill opposite-direction?
+        opposing = (existing_sz > 0 and not intent.is_buy) or (
+            existing_sz < 0 and intent.is_buy
+        )
+        if not opposing:
+            return None  # rule 3 (same-side add is fine)
+        # Conflict candidate. Compare weights.
+        new_weight = self._leader_weights.get(leader.lower(), 1.0)
+        orig_weight = self._leader_weights.get(originator, 1.0)
+        if new_weight > orig_weight:
+            return None  # rule 5 (override allowed)
+        # rule 4: skip
+        return (
+            f"originator={originator[:10]} (w={orig_weight:.2f}) "
+            f"vs new_leader={leader[:10]} (w={new_weight:.2f})"
         )
 
     def _is_reduce_only(self, coin: str, is_buy: bool, sz: float) -> bool:

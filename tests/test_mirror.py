@@ -13,6 +13,8 @@ def positions():
     p.total_exposure_usd.return_value = 0.0
     # Default: no existing position → reduce_only stays False
     p.state.get_position.return_value = (0.0, 0.0)
+    # Default: no originator set → conflict-lock falls through (PR #25)
+    p.state.get_position_originator.return_value = None
     return p
 
 
@@ -700,3 +702,145 @@ def test_post_round_min_skip(cfg, positions, journal, alerter, exchange, market_
     fill = {"tid": 9, "coin": "#11", "px": "1.05", "sz": "95", "side": "B"}
     mt.on_leader_fill("0xleader", fill)
     exchange.order.assert_not_called()
+
+
+# ---------- per-coin weight-priority conflict lock (PR #25) ----------
+
+
+def _real_state(tmp_path):
+    """Helper: real State (sqlite) instead of MagicMock so originator
+    tracking actually persists for conflict-lock tests."""
+    from src.state import State
+    return State(str(tmp_path / "test_state.db"))
+
+
+def test_conflict_lock_allows_first_leader_to_open(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """No existing position → first leader's signal is always allowed and
+    they become the originator."""
+    from src.positions import PositionTracker
+    state = _real_state(tmp_path)
+    info = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal)
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, pt, journal, alerter, market_meta)
+    fill = {"tid": 1, "coin": "BTC", "px": "100", "sz": "10", "side": "B"}
+    mt.on_leader_fill("0xleaderA", fill)
+    exchange.order.assert_called_once()
+    # Need to also simulate the position update (since exchange is mocked, the
+    # own_fill won't propagate). Do it manually for the next assertion to pass.
+    state.update_position("BTC", 1.0, 100.0)  # we long BTC now
+    state.set_position_originator("BTC", "0xleaderA")
+    assert state.get_position_originator("BTC") == "0xleadera"
+
+
+def test_conflict_lock_blocks_lower_weight_opposite_leader(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """Leader B (low weight) tries to short while leader A (high weight)
+    is long → blocked."""
+    from src.positions import PositionTracker
+    state = _real_state(tmp_path)
+    state.update_position("BTC", 1.0, 100.0)  # long position from leader A
+    state.set_position_originator("BTC", "0xleaderA")
+    info = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal)
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, pt, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xleaderA": 4.0, "0xleaderB": 1.5})
+    # Leader B tries to SELL BTC (opposite of A's long)
+    fill = {"tid": 2, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleaderB", fill)
+    exchange.order.assert_not_called()
+
+
+def test_conflict_lock_allows_higher_weight_override(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """Leader B (HIGH weight) can override leader A's (low weight) position
+    with an opposite-direction signal."""
+    from src.positions import PositionTracker
+    state = _real_state(tmp_path)
+    state.update_position("BTC", 1.0, 100.0)
+    state.set_position_originator("BTC", "0xleaderA")
+    info = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal)
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, pt, journal, alerter, market_meta)
+    # Leader A is now LOW weight, leader B HIGH
+    mt.update_leader_weights({"0xleaderA": 1.1, "0xleaderB": 4.0})
+    fill = {"tid": 3, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleaderB", fill)
+    exchange.order.assert_called_once()
+
+
+def test_conflict_lock_allows_same_leader_to_continue(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """Leader A is managing their own position — opposite-side signal from
+    THE SAME leader is allowed (closing/flipping is their right)."""
+    from src.positions import PositionTracker
+    state = _real_state(tmp_path)
+    state.update_position("BTC", 1.0, 100.0)
+    state.set_position_originator("BTC", "0xleaderA")
+    info = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal)
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, pt, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xleaderA": 4.0})
+    fill = {"tid": 4, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleaderA", fill)
+    exchange.order.assert_called_once()
+
+
+def test_conflict_lock_allows_same_direction_add_from_different_leader(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """Different leader, SAME direction = allowed (adding to position the
+    other leader opened is benign — they're not in conflict)."""
+    from src.positions import PositionTracker
+    state = _real_state(tmp_path)
+    state.update_position("BTC", 1.0, 100.0)
+    state.set_position_originator("BTC", "0xleaderA")
+    info = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal)
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, pt, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xleaderA": 4.0, "0xleaderB": 1.5})
+    # Leader B BUYS BTC (same direction as A's long)
+    fill = {"tid": 5, "coin": "BTC", "px": "100", "sz": "10", "side": "B"}
+    mt.on_leader_fill("0xleaderB", fill)
+    exchange.order.assert_called_once()
+
+
+def test_conflict_lock_originator_clears_when_position_closes(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """When a position closes (sz=0), the originator must clear so the next
+    leader to fire can claim the coin without conflict."""
+    state = _real_state(tmp_path)
+    state.update_position("BTC", 1.0, 100.0)
+    state.set_position_originator("BTC", "0xleaderA")
+    assert state.get_position_originator("BTC") == "0xleadera"
+    # Close it
+    state.update_position("BTC", 0.0, 0.0)
+    assert state.get_position_originator("BTC") is None  # cleared by update_position(sz=0)
+
+
+def test_conflict_lock_unknown_originator_falls_through(
+    cfg, journal, alerter, exchange, market_meta, tmp_path
+):
+    """Pre-PR-#25 positions have NULL originator. Treat them as unclaimed —
+    next leader to fire can take them. Avoids stuck-state on migration."""
+    from src.positions import PositionTracker
+    state = _real_state(tmp_path)
+    state.update_position("BTC", 1.0, 100.0)  # but no set_position_originator()
+    info = MagicMock()
+    pt = PositionTracker(info, "0xacc", state, journal)
+    cfg2 = _override_risk(cfg, dry_run=False, allowed_market_types=["perp"])
+    mt = MirrorTrader(cfg2, exchange, pt, journal, alerter, market_meta)
+    mt.update_leader_weights({"0xleaderA": 1.5})
+    fill = {"tid": 7, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
+    mt.on_leader_fill("0xleaderA", fill)
+    exchange.order.assert_called_once()

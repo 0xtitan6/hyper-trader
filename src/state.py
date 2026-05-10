@@ -35,7 +35,8 @@ class State:
         coin TEXT PRIMARY KEY,
         sz REAL NOT NULL,
         avg_px REAL NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        originator_address TEXT
     );
     """
 
@@ -45,6 +46,14 @@ class State:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(self.SCHEMA)
+            # Migration: add originator_address column to existing positions
+            # tables that predate PR #25. SQLite ALTER TABLE doesn't support
+            # IF NOT EXISTS, so we probe pragma + add only when missing.
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+            if "originator_address" not in cols:
+                conn.execute(
+                    "ALTER TABLE positions ADD COLUMN originator_address TEXT"
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -141,4 +150,38 @@ class State:
                 "ON CONFLICT(coin) DO UPDATE SET sz=excluded.sz, avg_px=excluded.avg_px, "
                 "updated_at=excluded.updated_at",
                 (coin, sz, avg_px, now),
+            )
+            # When a position closes (sz=0), clear the originator so the next
+            # leader can claim the coin without conflict.
+            if sz == 0:
+                conn.execute(
+                    "UPDATE positions SET originator_address=NULL WHERE coin=?",
+                    (coin,),
+                )
+
+    def get_position_originator(self, coin: str) -> str | None:
+        """Return the lowercase address of the leader who currently holds the
+        per-coin lock on this position, or None if unset/closed.
+
+        Used by MirrorTrader for weight-priority conflict resolution: if a
+        leader other than the originator tries to take an opposite-direction
+        position on coin, we compare leader weights and only override if the
+        new leader is more trusted.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT originator_address FROM positions WHERE coin = ?", (coin,)
+            ).fetchone()
+            if row is None:
+                return None
+            v = row["originator_address"]
+            return v.lower() if v else None
+
+    def set_position_originator(self, coin: str, address: str) -> None:
+        """Record the leader address that opened/expanded this position.
+        Called from MirrorTrader after a successful order submission."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE positions SET originator_address=? WHERE coin=?",
+                (address.lower(), coin),
             )
