@@ -27,9 +27,11 @@ def test_stale_alert_fires_once():
     h.start()
     time.sleep(0.3)
     h.stop()
-    error_calls = [c for c in a.alert.call_args_list if c.args[0] == "error"]
-    assert len(error_calls) == 1
-    assert "stale" in error_calls[0].args[1].lower()
+    # WS stale fires "warn" (not "error") after 2026-05-10 demote — these
+    # events are routine HL connection cycles, not real failures.
+    warn_calls = [c for c in a.alert.call_args_list if c.args[0] == "warn"]
+    assert len(warn_calls) == 1
+    assert "stale" in warn_calls[0].args[1].lower()
 
 
 def test_recovery_alert_after_touch():
@@ -41,7 +43,7 @@ def test_recovery_alert_after_touch():
     h.touch()
     h.stop()
     levels = [c.args[0] for c in a.alert.call_args_list]
-    assert "error" in levels and "info" in levels
+    assert "warn" in levels and "info" in levels  # stale=warn, recovery=info
 
 
 def test_stop_idempotent():
