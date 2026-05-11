@@ -222,6 +222,48 @@ The paper's directly-applicable subset for our surface:
 
 ---
 
+### Synthesis.trade copytrade API for Polymarket
+**What:** `api.synthesis.trade` is a unified API surface over Polymarket + Kalshi with first-class copytrade endpoints (`POST /polygon-copytrades`, etc.). Configure a copytrade subscription via API; their backend handles the WS subscriptions, leader fill detection, and order placement on Polymarket on our behalf.
+
+**Why:** Shortcuts months of engineering vs building Polymarket leader-discovery + execution from scratch. They've already solved the per-platform plumbing.
+
+**Source:** Discovered 2026-05-10 via the operator-facing UI at `synthesis.trade`.
+
+**Where:** New Python module talking to `api.synthesis.trade`. Auth via API key. Different from `polymarket-mm` (which is sports MM, low-frequency direct CLOB).
+
+**Stage gate:** Stage 2 + we've answered three open questions:
+1. What does their fee/markup structure look like? <20bp tolerable, >50bp marginal.
+2. Do they expose Polymarket leader-discovery (their docs mention Kalshi leaderboard but not Polymarket)?
+3. Reliability — is their backend production-grade?
+
+**Engineering estimate:** ~3-5 days for a working integration once questions answered.
+
+**Important caveat:** they're an aggregator middleware. Latency-sensitive strategies (e.g., sports MM, our polymarket-mm) should go DIRECT to Polymarket CLOB, not through synthesis.trade. This entry is specifically for retail-cadence copytrade where their abstraction adds more value than its fee overhead.
+
+---
+
+### Ondo tokenized stocks on HL spot — basis trade opportunity
+**What:** Ondo's tokenized stocks (HOOD, GOOGL, NVDA, etc., ~$1B AUM) bridging to Hyperliquid spot via LayerZero starting 2026-05-11. Meltfinance and Felix protocol are the first HyperEVM integrations.
+
+**Why this matters:** Unlocks **basis trades** between Ondo-bridged spot tokens (e.g. Ondo-HOOD) and existing xyz:HOOD perp. Specifically:
+- `Long Ondo-HOOD spot + Short xyz:HOOD perp` = neutral on HOOD price, capture funding rate differential
+- If xyz:HOOD funding stays positive (typical for retail-heavy paper-perps), short earns funding while spot hedges price
+- Pure carry trade, no directional risk, structurally positive EV when funding is positive
+
+**Where it fits in our system:**
+- **Hyper-trader (copy-trade):** zero code change needed. `market_meta` refreshes pick up new HL spot tokens automatically. If leaders trade them, bot mirrors.
+- **Future maker.py / parked strategies:** basis trades are exactly what concentrated maker strategies excel at. Stage 3+ activation.
+
+**Stage gate:**
+- Stage 1+ awareness: monitor journal for leader fills on Ondo tokens (auto-picked-up by market_meta)
+- Stage 3+ action: build a basis-trade strategy module that pairs Ondo-spot + xyz-perp legs with funding-rate-aware sizing
+
+**Source:** 2026-05-11 announcement (Ondo + LayerZero + Meltfinance/Felix).
+
+**Engineering estimate:** Hands-off until leaders trade them. Active strategy: 1-2 weeks engineering once funding data on Ondo tokens stabilizes.
+
+---
+
 ## Discipline notes
 
 When evaluating any of these for activation:
@@ -230,6 +272,7 @@ When evaluating any of these for activation:
 2. **At least one validated existing strategy before adding a second.** Don't run mirror + bayes-weighting + ML-signal + pairs-trading simultaneously on $90.
 3. **Diversification rule kicks in at Stage 2.** Until then, focus on making one thing work.
 4. **24-hour cooldown on activation decisions.** If a paper makes you want to ship something tonight, that's the signal to wait. The stage trigger is the green light, not the inspiration.
+5. **Platform-mortality filter (added 2026-05-11):** the prediction-market industry has ~90% mortality across 537 attempts per the public registry. Survivors are all crypto-native (Polymarket, Kalshi, Hyperliquid HIP-4) with ≥12 months of growing volume. **Rule:** cross-platform expansion requires the target venue to have ≥12 months of uptime + growing volume curve. Pre-launch announcements ("DeepBook Predict shipping soon", "Aftermath teasing perps", etc.) are watch-only — no engineering work until they survive a year and have visible volume.
 
 ---
 
