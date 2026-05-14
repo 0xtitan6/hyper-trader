@@ -264,6 +264,25 @@ The paper's directly-applicable subset for our surface:
 
 ---
 
+### Ika / ODWS for cross-chain agent signing
+**What:** Ika is a Sui-based 2PC-MPC signing network. ODWS (Open dWallet Standard, by @iamknownasfesal) is its developer surface — a multi-chain wallet SDK where a single dWallet signs across EVM, BTC, Solana, Sui, Cosmos, TON, Tron, Filecoin without the agent ever holding a private key. Signing requires both user-side and network-side participation, with the network side gated by an on-chain Policy Engine (rate limits, spend budgets, venue/asset allowlists).
+
+**Why it does NOT matter for hyper-trader (HL-only):** HL's agent wallet already gives us "constrained authority" at the venue layer — agent key can sign orders but cannot withdraw. Adding an MPC layer here is cargo-cult — more attack surface, no marginal safety. Our policy engine is `_risk_check` + capital ladder YAML, and that's appropriate for single-venue ops.
+
+**Why it MIGHT matter for Stage 3+ cross-chain pods:** Once we sign on chains without a built-in agent-wallet primitive (Sui copytrade, Drift on Solana, BTC collateral movement, treasury sweeps across rails), one cryptographic policy surface beats N drifting Python risk gates that fall out of sync. Specifically relevant if/when we:
+- Run a Sui-native copytrade pod
+- Run Drift/Solana perps
+- Move main-wallet capital between chains via automation (cold-storage sweeps, cross-chain rebalancing)
+- Need BTC collateral exposure
+
+**Stage gate:** Stage 3+ AND we're operating on ≥2 chains AND the spec is audited (currently "beta, unaudited" per author 2026-05-14). Until audited, evaluating it is premature — we're not betting agent capital on a beta MPC network even if the design is sound.
+
+**Source:** @ikadotxyz thread + @iamknownasfesal ODWS preview, 2026-05-14.
+
+**Engineering estimate:** N/A until audited + we have multi-chain need. At that point, ~1-2 weeks to integrate the SDK and define our policy schema, longer to harden.
+
+---
+
 ## Discipline notes
 
 When evaluating any of these for activation:
