@@ -74,6 +74,8 @@ Update this section when stage transitions happen.
 
 - **2026-05-08**: At Stage 1. Account ~$90. 9 closed mirror trades, net realized ~+$1.55 (PENDLE +$1.86, DOGE -$0.28, XMR -$0.13, HYPE -$1.11, TON -$1.62, etc.). Need 20+ trades over 2 weeks before considering Stage 2.
 
+- **2026-05-15**: **Stage 1→2 operator override.** Capital topped up +$500 (account now ~$600). Stage 1 trigger was *not* met (~10 round-trips not 20; ~10 days not 14; realized −$5.87 not net positive on the period — though unrealized was +$9 on ZEC/TAO shorts and HL portfolio showed +33% organic over the 10-day window). Rationale for override: two leaders consistently calling shorts right, PR #25 hardened the multi-leader failure mode that produced the −$5.87, more capital generates information faster than waiting at $90. Mitigation: deploying caps at **half of Stage 2 max** (`max_total_exposure_usd: 300`, `max_daily_loss_usd: 120`, `max_per_trade_usd: 75`) rather than full Stage 2 ($450/$200/$120). Full Stage 2 caps unlock only after the original Stage 1 trigger is genuinely met (20 round-trips + sustained net positive realized + 2 weeks). Effectively: **deploy the capital, throttle the deployment, still earn the trigger we skipped.** Discipline rules #1 (no emotional top-ups — this was deliberate not emotional, but still skipped the gate) and #4 (24h cooldown on >$500 changes) noted as future-tightening candidates.
+
 ---
 
 *The point of this doc is to be loud when the operator is quiet, and quiet when the operator is loud. When you're flat for a day and want to scale anyway — read this. When you're up 5% and want to bet bigger — read this. When you're down 15% and want to reset — read this.*
