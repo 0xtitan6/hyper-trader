@@ -328,6 +328,55 @@ def test_load_metrics_happy_path():
     assert kwargs_payload["user"] == "0xabc"
 
 
+def test_load_metrics_retries_on_429_then_succeeds(monkeypatch):
+    """429 errors are transient — retry with backoff and succeed on later attempt."""
+    import src.leader_score as ls
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(ls.time, "sleep", lambda s: sleeps.append(s))
+
+    info = MagicMock()
+    info.post.side_effect = [
+        RuntimeError("ClientError 429 rate limited"),
+        RuntimeError("ClientError 429 rate limited"),
+        [_f(1000, "B", 0), _f(2000, "A", 1.0)],
+    ]
+    m = load_metrics(info, "0xabc", max_retries=3, base_backoff_s=0.5)
+    assert m is not None
+    assert m.closing_fill_count == 1
+    assert info.post.call_count == 3
+    # exponential: 0.5, 1.0
+    assert sleeps == [0.5, 1.0]
+
+
+def test_load_metrics_non_retryable_fails_fast(monkeypatch):
+    """Non-429/timeout/connection errors must NOT retry — fail on first attempt."""
+    import src.leader_score as ls
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(ls.time, "sleep", lambda s: sleeps.append(s))
+
+    info = MagicMock()
+    info.post.side_effect = RuntimeError("malformed payload")
+    m = load_metrics(info, "0xabc", max_retries=3)
+    assert m is None
+    assert info.post.call_count == 1
+    assert sleeps == []  # never slept
+
+
+def test_load_metrics_exhausts_retries_returns_none(monkeypatch):
+    """Persistent 429 across all retries returns None without raising."""
+    import src.leader_score as ls
+
+    monkeypatch.setattr(ls.time, "sleep", lambda s: None)
+
+    info = MagicMock()
+    info.post.side_effect = RuntimeError("ClientError 429")
+    m = load_metrics(info, "0xabc", max_retries=3, base_backoff_s=0.1)
+    assert m is None
+    assert info.post.call_count == 3
+
+
 # ---------- perp_fill_fraction + perp_only scoring ----------
 
 

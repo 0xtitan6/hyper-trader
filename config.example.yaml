@@ -1,10 +1,11 @@
 discovery:
-  period: 7d              # 24h | 7d | 30d | all
+  period: 30d             # 24h | 7d | 30d | all — 30d recommended so always_follow leaders inactive in the past 7d still surface with metrics
   top_n: 5                # max 9 — Hyperliquid WS user-sub cap is 10/IP and own-fill sub uses 1
   min_trades: 50
   min_volume_usd: 5000
   min_pnl_usd: 100
   refresh_seconds: 600
+  score_lookback_hours: 720          # 30d — matches discovery.period; per-leader quality metrics use this same window
 
 sizing:
   mode: proportional      # proportional | fixed

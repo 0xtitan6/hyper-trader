@@ -84,22 +84,52 @@ def load_metrics(
     address: str,
     lookback_hours: float = 168.0,
     perp_only: bool = False,
+    max_retries: int = 3,
+    base_backoff_s: float = 1.0,
 ) -> LeaderMetrics | None:
     """Fetch fills for `address` over the last `lookback_hours` and compute metrics.
 
     `perp_only=True` restricts time/sharpe/direction/drawdown computations to
     perp fills only, while `perp_fill_fraction` always reflects the full fill
     universe. Returns None on fetch failure or unparseable response.
+
+    Retries with exponential backoff on transient HL errors (HTTP 429,
+    timeouts, connection drops). Non-retryable errors (auth, malformed
+    request, etc.) fail fast without burning retries.
     """
     since_ms = int((time.time() - lookback_hours * 3600) * 1000)
-    try:
-        fills = info.post(
-            "/info",
-            {"type": "userFillsByTime", "user": address.lower(), "startTime": since_ms},
-        )
-    except Exception:
-        log.exception("leader_score: userFillsByTime fetch failed for %s", address[:10])
-        return None
+    payload = {"type": "userFillsByTime", "user": address.lower(), "startTime": since_ms}
+
+    fills: object = None
+    for attempt in range(max_retries):
+        try:
+            fills = info.post("/info", payload)
+            break
+        except Exception as e:
+            err_str = str(e)
+            is_retryable = (
+                "429" in err_str
+                or "Timeout" in err_str
+                or "Connection" in err_str
+            )
+            if not is_retryable or attempt + 1 >= max_retries:
+                log.warning(
+                    "leader_score: userFillsByTime failed for %s after %d attempt(s): %s",
+                    address[:10],
+                    attempt + 1,
+                    err_str[:160],
+                )
+                return None
+            sleep_s = base_backoff_s * (2**attempt)
+            log.info(
+                "leader_score: retryable error on %s (attempt %d/%d); sleeping %.1fs",
+                address[:10],
+                attempt + 1,
+                max_retries,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+
     if not isinstance(fills, list):
         return None
     return _compute_metrics(
