@@ -1,0 +1,16 @@
+[Unit]
+Description=hyper-trader watchdog — 24/7 liveness + freshness monitor
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/.openclaw/workspace/hyper-trader
+ExecStart=/usr/bin/python3 /home/ec2-user/.openclaw/workspace/hyper-trader/scripts/watchdog.py --interval 60
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ec2-user/.openclaw/workspace/hyper-trader/state/watchdog.log
+StandardError=append:/home/ec2-user/.openclaw/workspace/hyper-trader/state/watchdog.log
+
+[Install]
+WantedBy=multi-user.target
