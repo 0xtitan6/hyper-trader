@@ -15,6 +15,7 @@ from .connection import ConnectionHealth
 from .errors import PreflightError
 from .follower import FillFollower
 from .leader_reconcile import LeaderReconciler
+from .ws_health import WSHealthMonitor
 from .funding import FundingTracker
 from .hl_outcome import register_outcome_assets
 from .journal import Journal
@@ -121,6 +122,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     health.start()
 
+    # WSHealthMonitor wraps info.subscribe so we track every WS subscription
+    # and can rebuild + replay them if the underlying connection silently
+    # dies. Routes all downstream subscribe() calls (positions, follower)
+    # through the monitor transparently. See src/ws_health.py for the
+    # silent-degrade bug we're fixing here.
+    ws_health = WSHealthMonitor(info, alerter, stale_threshold_s=cfg.ops.ws_stale_threshold_s * 2)
+    info.subscribe = ws_health.subscribe  # type: ignore[method-assign]
+    ws_health.start()
+
     positions = PositionTracker(info, cfg.account_address, state, journal, health, alerter=alerter)
     # Reconcile BEFORE subscribing — the WS snapshot can be truncated and the
     # `user_state` endpoint is the authoritative source for current positions
@@ -134,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("No leaders matched filters; aborting.")
         journal.write("startup_aborted", reason="no_leaders")
         health.stop()
+        ws_health.stop()
         return 1
 
     journal.write(
@@ -219,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         journal.write("shutdown")
         alerter.alert("info", "hyper-trader stopping")
         health.stop()
+        ws_health.stop()
         alerter.stop()
     return 0
 
