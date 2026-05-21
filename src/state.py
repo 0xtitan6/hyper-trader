@@ -179,9 +179,25 @@ class State:
 
     def set_position_originator(self, coin: str, address: str) -> None:
         """Record the leader address that opened/expanded this position.
-        Called from MirrorTrader after a successful order submission."""
+        Called from MirrorTrader after a successful order submission.
+
+        Uses INSERT-OR-UPDATE because of a race condition: when a NEW position
+        is opened, MirrorTrader calls this method immediately after
+        exchange.order() returns success — but the position row is only
+        created when the WS own-fill arrives at PositionTracker._on_fill()
+        ms-to-s later. A plain UPDATE was a no-op in that gap, and the
+        originator ended up NULL even on properly mirrored entries (caught
+        2026-05-21 when LeaderReconciler flagged an "orphan" WLD short on a
+        freshly mirrored fill). The placeholder sz=0/avg_px=0 we insert here
+        is overwritten by update_position() when the actual fill arrives —
+        update_position's ON CONFLICT clause only touches sz/avg_px/updated_at,
+        leaving originator_address intact.
+        """
+        now = int(time.time())
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE positions SET originator_address=? WHERE coin=?",
-                (address.lower(), coin),
+                "INSERT INTO positions(coin, sz, avg_px, updated_at, originator_address) "
+                "VALUES (?, 0.0, 0.0, ?, ?) "
+                "ON CONFLICT(coin) DO UPDATE SET originator_address=excluded.originator_address",
+                (coin, now, address.lower()),
             )

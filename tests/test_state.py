@@ -113,6 +113,46 @@ def test_unmark_tid_seen_missing_returns_false(state: State):
     assert state.unmark_tid_seen(9999) is False
 
 
+def test_set_position_originator_when_row_exists(state: State):
+    """Normal path: position row was created by update_position first."""
+    state.update_position("BTC", -0.5, 60000.0)
+    state.set_position_originator("BTC", "0xABC")
+    assert state.get_position_originator("BTC") == "0xabc"
+    # update_position must not clobber originator on subsequent calls
+    state.update_position("BTC", -0.6, 60100.0)
+    assert state.get_position_originator("BTC") == "0xabc"
+
+
+def test_set_position_originator_creates_row_when_missing(state: State):
+    """Race-condition path: MirrorTrader calls set_position_originator
+    BEFORE the WS own-fill creates the position row (PR #32 fix). Originator
+    must still be recorded; row is created with sz=0 placeholder."""
+    assert state.get_position_originator("BTC") is None
+    state.set_position_originator("BTC", "0xABC")
+    assert state.get_position_originator("BTC") == "0xabc"
+    # Row created with placeholder sz=0
+    assert state.get_position("BTC") == (0.0, 0.0)
+
+
+def test_set_position_originator_then_fill_arrives_preserves_originator(state: State):
+    """The full race scenario: originator set first (mirror submit), then the
+    own-fill arrives and update_position runs. Originator must survive."""
+    state.set_position_originator("BTC", "0xABC")
+    # WS own-fill arrives milliseconds later — writes sz/avg_px
+    state.update_position("BTC", -0.5, 60000.0)
+    assert state.get_position("BTC") == (-0.5, 60000.0)
+    assert state.get_position_originator("BTC") == "0xabc"
+
+
+def test_set_position_originator_overrides_previous(state: State):
+    """If set_position_originator is called twice, latest wins (e.g. weight
+    conflict took over the coin and we want to record the new originator)."""
+    state.update_position("BTC", -0.5, 60000.0)
+    state.set_position_originator("BTC", "0xABC")
+    state.set_position_originator("BTC", "0xDEF")
+    assert state.get_position_originator("BTC") == "0xdef"
+
+
 def test_concurrent_mark_tid_seen_only_one_wins(tmp_path: Path):
     import threading
 
