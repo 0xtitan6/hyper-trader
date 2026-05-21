@@ -81,6 +81,14 @@ class RiskConfig:
     max_daily_loss_usd: float
     allowed_market_types: list[str]
     kill_switch_file: str
+    # PR #30: leader exit auto-close defense. When True the bot will submit a
+    # reduce_only IOC if the originating leader has flat'd/flipped on-chain
+    # while we still hold the mirror. Default False — alert-only — so the
+    # operator can validate the detection logic before allowing autonomous
+    # closes. `leader_exit_debounce_cycles` is the number of consecutive
+    # detection cycles (5-min cadence) required before acting; 2 = ~10 min.
+    leader_exit_auto_close: bool = False
+    leader_exit_debounce_cycles: int = 2
 
 
 @dataclass(frozen=True)

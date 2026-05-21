@@ -14,6 +14,7 @@ from .config import Config, load_config
 from .connection import ConnectionHealth
 from .errors import PreflightError
 from .follower import FillFollower
+from .leader_reconcile import LeaderReconciler
 from .funding import FundingTracker
 from .hl_outcome import register_outcome_assets
 from .journal import Journal
@@ -160,10 +161,24 @@ def main(argv: list[str] | None = None) -> int:
     follower.follow([t.address for t in leaders])
     follower_holder["f"] = follower
 
+    leader_reconciler = LeaderReconciler(
+        info=info,
+        state=state,
+        journal=journal,
+        alerter=alerter,
+        exchange=exchange,
+        market_meta=market_meta,
+        auto_close=cfg.risk.leader_exit_auto_close,
+        debounce_cycles=cfg.risk.leader_exit_debounce_cycles,
+        slippage_bps=cfg.sizing.ioc_slippage_bps,
+    )
+
     stop = install_signal_handler()
     last_refresh = time.time()
     last_reconcile = time.time()
+    last_leader_recon = time.time()
     reconcile_interval_s = 300  # 5 min — picks up HIP-4 settlement + manual trades
+    leader_recon_interval_s = 300  # 5 min — detect leader exits we missed via WS
     log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
     try:
         while not stop.is_set():
@@ -176,6 +191,12 @@ def main(argv: list[str] | None = None) -> int:
                     positions.reconcile_with_user_state()
                 except Exception:
                     log.exception("Periodic reconcile failed")
+            if now - last_leader_recon >= leader_recon_interval_s:
+                last_leader_recon = now
+                try:
+                    leader_reconciler.reconcile(follower.addresses)
+                except Exception:
+                    log.exception("Leader reconcile failed")
             if now - last_refresh < cfg.discovery.refresh_seconds:
                 continue
             last_refresh = now
