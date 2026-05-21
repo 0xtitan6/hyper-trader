@@ -14,6 +14,7 @@ from .config import Config, load_config
 from .connection import ConnectionHealth
 from .errors import PreflightError
 from .follower import FillFollower
+from .funding_history import FundingHistory
 from .leader_reconcile import LeaderReconciler
 from .ws_health import WSHealthMonitor
 from .funding import FundingTracker
@@ -184,12 +185,23 @@ def main(argv: list[str] | None = None) -> int:
         slippage_bps=cfg.sizing.ioc_slippage_bps,
     )
 
+    funding_history = FundingHistory(state)
+    # Cold-start backfill of funding history; subsequent polls are incremental.
+    try:
+        backfilled = funding_history.poll(info, cfg.account_address)
+        if backfilled:
+            log.info("FundingHistory: backfilled %d events on startup", backfilled)
+    except Exception:
+        log.exception("FundingHistory startup backfill failed")
+
     stop = install_signal_handler()
     last_refresh = time.time()
     last_reconcile = time.time()
     last_leader_recon = time.time()
+    last_funding_poll = time.time()
     reconcile_interval_s = 300  # 5 min — picks up HIP-4 settlement + manual trades
     leader_recon_interval_s = 300  # 5 min — detect leader exits we missed via WS
+    funding_poll_interval_s = 3600  # 1 hour — matches HL's funding accrual cycle
     log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
     try:
         while not stop.is_set():
@@ -208,6 +220,12 @@ def main(argv: list[str] | None = None) -> int:
                     leader_reconciler.reconcile(follower.addresses)
                 except Exception:
                     log.exception("Leader reconcile failed")
+            if now - last_funding_poll >= funding_poll_interval_s:
+                last_funding_poll = now
+                try:
+                    funding_history.poll(info, cfg.account_address)
+                except Exception:
+                    log.exception("Funding history poll failed")
             if now - last_refresh < cfg.discovery.refresh_seconds:
                 continue
             last_refresh = now

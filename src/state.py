@@ -38,6 +38,15 @@ class State:
         updated_at INTEGER NOT NULL,
         originator_address TEXT
     );
+    CREATE TABLE IF NOT EXISTS funding_events (
+        time_ms INTEGER NOT NULL,
+        coin TEXT NOT NULL,
+        usdc REAL NOT NULL,
+        szi REAL,
+        rate REAL,
+        PRIMARY KEY (time_ms, coin)
+    );
+    CREATE INDEX IF NOT EXISTS idx_funding_time ON funding_events(time_ms);
     """
 
     def __init__(self, db_path: str):
@@ -185,3 +194,57 @@ class State:
                 "UPDATE positions SET originator_address=? WHERE coin=?",
                 (address.lower(), coin),
             )
+
+    def record_funding_event(
+        self, time_ms: int, coin: str, usdc: float, szi: float = 0.0, rate: float = 0.0
+    ) -> bool:
+        """Insert one funding event. Dedupes via (time_ms, coin) PK.
+        Returns True if newly inserted, False if duplicate.
+
+        HL emits funding events hourly per perp position. Positive `usdc` =
+        the account received funding (we were short while funding was
+        positive, or long while negative). Negative = we paid funding.
+        """
+        with self._lock, self._connect() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO funding_events(time_ms, coin, usdc, szi, rate) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (time_ms, coin, usdc, szi, rate),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def funding_total_since(self, since_ts: int) -> float:
+        """Sum of net funding USDC since a unix timestamp (seconds). Useful
+        for closing the books gap — funding is an income stream that our
+        own_fills table does NOT capture."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(usdc), 0.0) AS total FROM funding_events "
+                "WHERE time_ms >= ?",
+                (since_ts * 1000,),
+            ).fetchone()
+            return float(row["total"])
+
+    def funding_by_coin_since(self, since_ts: int) -> dict[str, float]:
+        """Breakdown of funding USDC by coin since a unix timestamp.
+        Useful for attributing which positions are funding-positive vs negative."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT coin, COALESCE(SUM(usdc), 0.0) AS total FROM funding_events "
+                "WHERE time_ms >= ? GROUP BY coin",
+                (since_ts * 1000,),
+            ).fetchall()
+            return {r["coin"]: float(r["total"]) for r in rows}
+
+    def last_funding_event_ms(self) -> int | None:
+        """Most recent recorded funding event timestamp (ms), or None if empty.
+        Used by FundingHistory to advance the polling cursor incrementally."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(time_ms) AS m FROM funding_events"
+            ).fetchone()
+            v = row["m"]
+            return int(v) if v is not None else None
