@@ -17,6 +17,7 @@ from .follower import FillFollower
 from .leader_reconcile import LeaderReconciler
 from .ws_health import WSHealthMonitor
 from .funding import FundingTracker
+from .hl_hip3 import register_hip3_dexes
 from .hl_outcome import register_outcome_assets
 from .journal import Journal
 from .leaders import discover_leaders
@@ -93,6 +94,12 @@ def main(argv: list[str] | None = None) -> int:
     n_outcomes = register_outcome_assets(info)
     log.info("Registered %d HIP-4 outcome legs for trading", n_outcomes)
 
+    # Register HIP-3 builder-deployed perp dexes (xyz, flx, vntl, etc.) so
+    # Exchange.order("xyz:NVDA", ...) resolves. Same patch pattern as
+    # outcomes — SDK's Info() defaults to original dex only.
+    n_hip3 = register_hip3_dexes(info)
+    log.info("Registered %d HIP-3 perp assets for trading", n_hip3)
+
     state = State(cfg.ops.state_db)
     journal = Journal(cfg.ops.journal_path)
     alerter = build_alerter(cfg)
@@ -102,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     # Exchange spawns its own internal Info — patch THAT too, otherwise
     # exchange.order("#NN", ...) still fails despite our outer info patch.
     register_outcome_assets(exchange.info)
+    register_hip3_dexes(exchange.info)
 
     # Backfill closure — wired into ConnectionHealth so a stale WS triggers a REST sweep
     follower_holder: dict[str, FillFollower] = {}
