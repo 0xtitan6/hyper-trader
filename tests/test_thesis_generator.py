@@ -283,3 +283,107 @@ def test_consecutive_runs_overwrite_thesis(state, cache):
     gen.info = _mock_info(leaders2)
     gen.run_cycle()
     assert cache.get("BTC").stance == STANCE_BEAR  # type: ignore[union-attr]
+
+
+# --- fear/greed enrichment via PREF client ------------------------------
+
+
+def test_fear_greed_attached_to_evidence_when_pref_client_provided(state, cache):
+    """PREF returns (22, 'Extreme Fear') → both fields land in evidence."""
+    pref = MagicMock()
+    pref.get_fear_greed_index.return_value = (22, "Extreme Fear")
+    leaders = {"0xa": {"BTC": 0.5}, "0xb": {"BTC": 1.0}}
+    info = _mock_info(leader_positions=leaders)
+    from src.thesis_generator import ThesisGenerator
+    gen = ThesisGenerator(info=info, state=state, cache=cache,
+                          leader_addresses=["0xa", "0xb"], ttl_s=600,
+                          pref_client=pref)
+    out = gen.run_cycle()
+    assert out["BTC"].evidence["fear_greed"] == 22
+    assert out["BTC"].evidence["fear_greed_classification"] == "Extreme Fear"
+    # PREF was called exactly once even though there's one coin in this cycle
+    # (per-cycle cache, not per-coin)
+    assert pref.get_fear_greed_index.call_count == 1
+
+
+def test_fear_greed_cache_reused_within_ttl(state, cache):
+    """Second run_cycle within TTL window does NOT call PREF again."""
+    pref = MagicMock()
+    pref.get_fear_greed_index.return_value = (50, "Neutral")
+    leaders = {"0xa": {"BTC": 0.5}, "0xb": {"BTC": 1.0}}
+    info = _mock_info(leader_positions=leaders)
+    from src.thesis_generator import ThesisGenerator
+    gen = ThesisGenerator(info=info, state=state, cache=cache,
+                          leader_addresses=["0xa", "0xb"], ttl_s=600,
+                          pref_client=pref)
+    gen.run_cycle()
+    gen.run_cycle()
+    # Only the first cycle's call hit PREF — second used cached value
+    assert pref.get_fear_greed_index.call_count == 1
+
+
+def test_fear_greed_cache_refreshes_after_ttl(state, cache, monkeypatch):
+    """After FEAR_GREED_TTL_S elapses, PREF gets called again."""
+    pref = MagicMock()
+    pref.get_fear_greed_index.return_value = (60, "Greed")
+    leaders = {"0xa": {"BTC": 0.5}, "0xb": {"BTC": 1.0}}
+    info = _mock_info(leader_positions=leaders)
+    from src.thesis_generator import ThesisGenerator
+    gen = ThesisGenerator(info=info, state=state, cache=cache,
+                          leader_addresses=["0xa", "0xb"], ttl_s=600,
+                          pref_client=pref)
+    gen.run_cycle()
+    # Fast-forward past TTL
+    import time as time_module
+    real_time = time_module.time()
+    monkeypatch.setattr(time_module, "time", lambda: real_time + 2000)
+    gen.run_cycle()
+    assert pref.get_fear_greed_index.call_count == 2
+
+
+def test_no_fear_greed_when_pref_client_missing(state, cache):
+    """Generator with pref_client=None just omits the sentiment evidence."""
+    leaders = {"0xa": {"BTC": 0.5}, "0xb": {"BTC": 1.0}}
+    info = _mock_info(leader_positions=leaders)
+    from src.thesis_generator import ThesisGenerator
+    gen = ThesisGenerator(info=info, state=state, cache=cache,
+                          leader_addresses=["0xa", "0xb"], ttl_s=600,
+                          pref_client=None)
+    out = gen.run_cycle()
+    assert "fear_greed" not in out["BTC"].evidence
+
+
+def test_fear_greed_call_failure_does_not_block_thesis(state, cache):
+    """PREF returns None — generator still writes thesis without sentiment."""
+    pref = MagicMock()
+    pref.get_fear_greed_index.return_value = None
+    leaders = {"0xa": {"BTC": 0.5}, "0xb": {"BTC": 1.0}}
+    info = _mock_info(leader_positions=leaders)
+    from src.thesis_generator import ThesisGenerator
+    gen = ThesisGenerator(info=info, state=state, cache=cache,
+                          leader_addresses=["0xa", "0xb"], ttl_s=600,
+                          pref_client=pref)
+    out = gen.run_cycle()
+    assert out["BTC"].stance == STANCE_BULL  # rest of logic unaffected
+    assert "fear_greed" not in out["BTC"].evidence
+
+
+def test_fear_greed_falls_back_to_stale_cache_when_refresh_fails(state, cache, monkeypatch):
+    """If a refresh fails but we have a cached value, use the cached value
+    rather than dropping the signal entirely."""
+    pref = MagicMock()
+    pref.get_fear_greed_index.side_effect = [(40, "Fear"), None]  # 2nd call fails
+    leaders = {"0xa": {"BTC": 0.5}, "0xb": {"BTC": 1.0}}
+    info = _mock_info(leader_positions=leaders)
+    from src.thesis_generator import ThesisGenerator
+    gen = ThesisGenerator(info=info, state=state, cache=cache,
+                          leader_addresses=["0xa", "0xb"], ttl_s=600,
+                          pref_client=pref)
+    gen.run_cycle()
+    # Fast forward past TTL to trigger refresh, which fails
+    import time as time_module
+    real_time = time_module.time()
+    monkeypatch.setattr(time_module, "time", lambda: real_time + 2000)
+    out = gen.run_cycle()
+    # Cached value still present in evidence
+    assert out["BTC"].evidence["fear_greed"] == 40
