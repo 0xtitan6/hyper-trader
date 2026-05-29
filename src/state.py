@@ -47,6 +47,16 @@ class State:
         PRIMARY KEY (time_ms, coin)
     );
     CREATE INDEX IF NOT EXISTS idx_funding_time ON funding_events(time_ms);
+    CREATE TABLE IF NOT EXISTS coin_thesis (
+        coin TEXT PRIMARY KEY,
+        stance TEXT NOT NULL,         -- 'bull' | 'bear' | 'neutral'
+        confidence REAL NOT NULL,     -- 0.0 to 1.0
+        generated_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        source TEXT NOT NULL,         -- 'manual' | 'rule_based' | 'llm' | etc.
+        evidence TEXT                 -- JSON blob with the inputs used
+    );
+    CREATE INDEX IF NOT EXISTS idx_thesis_expires ON coin_thesis(expires_at);
     """
 
     def __init__(self, db_path: str):
