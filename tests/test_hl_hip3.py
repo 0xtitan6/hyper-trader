@@ -83,6 +83,38 @@ def test_idempotent_overwrites_same_mapping():
     assert info.coin_to_asset["xyz:NVDA"] == 110_000
 
 
+def test_periodic_refresh_picks_up_newly_added_symbols():
+    """Real-world scenario: HL adds a new symbol to xyz dex after our startup
+    registration. Re-running register_hip3_dexes against the now-bigger
+    universe must add the new symbol without disturbing existing entries."""
+    # First registration: 1 symbol
+    info = _info_with_dexes(
+        dexes_response=[None, {"name": "xyz"}],
+        meta_by_dex={"xyz": {"universe": [{"name": "xyz:NVDA", "szDecimals": 4}]}},
+    )
+    register_hip3_dexes(info)
+    assert "xyz:NVDA" in info.coin_to_asset
+    assert "xyz:QNT" not in info.coin_to_asset
+
+    # Simulate HL adding a new symbol — rebuild the mock with bigger universe
+    info2 = _info_with_dexes(
+        dexes_response=[None, {"name": "xyz"}],
+        meta_by_dex={"xyz": {"universe": [
+            {"name": "xyz:NVDA", "szDecimals": 4},
+            {"name": "xyz:QNT", "szDecimals": 4},
+        ]}},
+    )
+    # Copy the existing coin map so we're testing on the same instance state
+    info2.coin_to_asset = dict(info.coin_to_asset)
+    register_hip3_dexes(info2)
+    assert "xyz:NVDA" in info2.coin_to_asset
+    assert "xyz:QNT" in info2.coin_to_asset
+    # Original symbol's asset_id unchanged
+    assert info2.coin_to_asset["xyz:NVDA"] == 110_000
+    # New symbol gets the next index
+    assert info2.coin_to_asset["xyz:QNT"] == 110_001
+
+
 # --- error handling --------------------------------------------------------
 
 

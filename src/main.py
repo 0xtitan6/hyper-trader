@@ -207,9 +207,16 @@ def main(argv: list[str] | None = None) -> int:
     last_reconcile = time.time()
     last_leader_recon = time.time()
     last_funding_poll = time.time()
+    last_hip3_refresh = time.time()
     reconcile_interval_s = 300  # 5 min — picks up HIP-4 settlement + manual trades
     leader_recon_interval_s = 300  # 5 min — detect leader exits we missed via WS
     funding_poll_interval_s = 3600  # 1 hour — matches HL's funding accrual cycle
+    # HIP-3 builder dexes (xyz, flx, etc.) add new symbols over time. Without
+    # periodic re-registration, exchange.order("xyz:NEW_SYMBOL", ...) raises
+    # KeyError on anything added after startup (live cost 2026-05-23 xyz:NVDA,
+    # 2026-05-28 xyz:QNT). re-register every 30 min is cheap (2 small HTTP
+    # calls per dex) and idempotent (set_perp_meta overwrites existing entries).
+    hip3_refresh_interval_s = 1800
     log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
     try:
         while not stop.is_set():
@@ -234,6 +241,20 @@ def main(argv: list[str] | None = None) -> int:
                     funding_history.poll(info, cfg.account_address)
                 except Exception:
                     log.exception("Funding history poll failed")
+            if now - last_hip3_refresh >= hip3_refresh_interval_s:
+                last_hip3_refresh = now
+                try:
+                    prev_count = len(getattr(info, "coin_to_asset", {}))
+                    register_hip3_dexes(info)
+                    register_hip3_dexes(exchange.info)
+                    new_count = len(getattr(info, "coin_to_asset", {}))
+                    if new_count != prev_count:
+                        log.info(
+                            "HIP-3 refresh: coin map %d → %d (gained %d new symbols)",
+                            prev_count, new_count, new_count - prev_count,
+                        )
+                except Exception:
+                    log.exception("HIP-3 periodic refresh failed")
             if now - last_refresh < cfg.discovery.refresh_seconds:
                 continue
             last_refresh = now
