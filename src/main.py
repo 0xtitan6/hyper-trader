@@ -16,6 +16,7 @@ from .errors import PreflightError
 from .follower import FillFollower
 from .funding_history import FundingHistory
 from .leader_reconcile import LeaderReconciler
+from .pref_client import PrefClient
 from .thesis import ThesisCache
 from .thesis_generator import ThesisGenerator
 from .ws_health import WSHealthMonitor
@@ -210,12 +211,16 @@ def main(argv: list[str] | None = None) -> int:
     # inspect via `python -m src.thesis_cli list` to validate output quality
     # before we wire the filter into the hot path (separate PR).
     thesis_cache = ThesisCache(state)
+    # PrefClient is a soft dependency — if credentials missing or PREF is
+    # down, the generator silently runs without sentiment enrichment.
+    pref_client = PrefClient()
     thesis_generator = ThesisGenerator(
         info=info,
         state=state,
         cache=thesis_cache,
         leader_addresses=[t.address for t in leaders],
         ttl_s=900,  # 15 min — 50% longer than cycle so missed cycle doesn't blank cache
+        pref_client=pref_client,
     )
 
     stop = install_signal_handler()

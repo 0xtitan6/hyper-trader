@@ -45,6 +45,7 @@ import time
 from typing import Any
 from urllib.error import URLError
 
+from .pref_client import PrefClient
 from .protocols import InfoProto
 from .state import State
 from .thesis import (
@@ -68,6 +69,10 @@ CONFIDENCE_BOTH_AGREE = 0.9
 CONFIDENCE_CONCORDANCE_ONLY = 0.7
 CONFIDENCE_FUNDING_ONLY = 0.5
 
+# Fear/greed caching — the alternative.me source updates ~daily so polling
+# faster is wasteful. Cache 30 min, refresh on stale.
+FEAR_GREED_TTL_S = 1800
+
 
 class ThesisGenerator:
     """Generates per-coin theses from funding + cross-leader concordance.
@@ -85,12 +90,20 @@ class ThesisGenerator:
         cache: ThesisCache,
         leader_addresses: list[str],
         ttl_s: int = 900,
+        pref_client: PrefClient | None = None,
     ):
         self.info = info
         self.state = state
         self.cache = cache
         self.leader_addresses = [a.lower() for a in leader_addresses]
         self.ttl_s = ttl_s
+        # Optional PREF client for crypto sentiment. None disables enrichment
+        # without affecting any other rule — the rest of the generator runs
+        # unchanged. Useful for tests + degraded mode if PREF is down.
+        self.pref_client = pref_client
+        self._fear_greed_value: int | None = None
+        self._fear_greed_classification: str | None = None
+        self._fear_greed_fetched_at: float = 0.0
 
     def update_leaders(self, addresses: list[str]) -> None:
         """Refresh leader list — caller invokes after discover_leaders runs."""
@@ -105,6 +118,7 @@ class ThesisGenerator:
             return {}
 
         funding_apr = self._fetch_funding_apr()  # may be empty dict on fetch failure
+        fear_greed = self._refresh_fear_greed()  # cached internally, may be None
         coin_candidates = self._candidate_coins(leader_positions)
 
         written: dict[str, CoinThesis] = {}
@@ -113,6 +127,7 @@ class ThesisGenerator:
                 coin=coin,
                 leader_positions=leader_positions,
                 funding_apr=funding_apr,
+                fear_greed=fear_greed,
             )
             t = self.cache.set(
                 coin=coin,
@@ -160,6 +175,7 @@ class ThesisGenerator:
         coin: str,
         leader_positions: dict[str, dict[str, float]],
         funding_apr: dict[str, float],
+        fear_greed: tuple[int, str] | None = None,
     ) -> tuple[str, float, dict[str, Any]]:
         """Apply the rule set. Returns (stance, confidence, evidence_dict)."""
         # Cross-leader concordance: count signed positions in this coin
@@ -190,6 +206,14 @@ class ThesisGenerator:
         }
         if funding is not None:
             evidence["funding_apr"] = round(funding, 4)
+        # Fear/greed enrichment — same value across all coins per cycle
+        # (it's a market-wide sentiment index, not per-asset). Captured as
+        # evidence ONLY in v1; rules don't consume it yet. After live
+        # observation we'll decide how to incorporate (likely: scale
+        # confidence on weak signals during extreme regimes).
+        if fear_greed is not None:
+            evidence["fear_greed"] = fear_greed[0]
+            evidence["fear_greed_classification"] = fear_greed[1]
 
         if concord_bull and funding_bull:
             evidence["rule"] = "concordance_bull + funding_bull"
@@ -246,6 +270,38 @@ class ThesisGenerator:
             out[addr] = book
             any_success = True
         return out if any_success else None
+
+    def _refresh_fear_greed(self) -> tuple[int, str] | None:
+        """Return cached (value, classification) tuple, refreshing from PREF
+        if cache is older than FEAR_GREED_TTL_S. Returns None if PREF client
+        is not configured, or PREF call fails (graceful degrade — generator
+        runs without sentiment).
+
+        Decoupling poll cadence from `run_cycle()` cadence: at 30 min cache
+        + 10 min thesis cycle, we make ~48 PREF calls/day instead of 144.
+        The source (alternative.me) updates ~1×/day so anything faster is
+        wasteful.
+        """
+        if self.pref_client is None:
+            return None
+        age = time.time() - self._fear_greed_fetched_at
+        if age < FEAR_GREED_TTL_S and self._fear_greed_value is not None:
+            return self._fear_greed_value, self._fear_greed_classification or ""
+        # Stale or unset — refresh
+        result = self.pref_client.get_fear_greed_index()
+        if result is None:
+            log.info("thesis_generator: fear_greed refresh failed; using cached if any")
+            if self._fear_greed_value is not None:
+                return self._fear_greed_value, self._fear_greed_classification or ""
+            return None
+        self._fear_greed_value = result[0]
+        self._fear_greed_classification = result[1]
+        self._fear_greed_fetched_at = time.time()
+        log.info(
+            "thesis_generator: fear_greed refreshed value=%d classification=%s",
+            result[0], result[1],
+        )
+        return result
 
     def _fetch_funding_apr(self) -> dict[str, float]:
         """Fetch current funding rates for all perps, convert hourly rate to APR%.
