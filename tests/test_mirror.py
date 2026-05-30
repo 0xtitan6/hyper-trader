@@ -844,3 +844,115 @@ def test_conflict_lock_unknown_originator_falls_through(
     fill = {"tid": 7, "coin": "BTC", "px": "100", "sz": "10", "side": "A"}
     mt.on_leader_fill("0xleaderA", fill)
     exchange.order.assert_called_once()
+
+
+# --- order submit retry on 429 ---------------------------------------------
+
+
+def _client_error_429():
+    """Build a ClientError matching what hyperliquid SDK raises on rate-limit."""
+    from hyperliquid.utils.error import ClientError
+    return ClientError(429, None, "null", None, {})
+
+
+def test_order_429_retries_succeed(
+    cfg, positions, journal, exchange, outcome_fill, market_meta, monkeypatch
+):
+    """Two consecutive 429s then success → final result returns, mirror records
+    the order_result, no error alert fires."""
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange.order.side_effect = [
+        _client_error_429(),
+        _client_error_429(),
+        {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}},
+    ]
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.mirror.time.sleep", lambda s: sleeps.append(s))
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    assert exchange.order.call_count == 3
+    assert sleeps == [1.0, 2.0]
+    err = [c for c in alerter.alert.call_args_list if c.args[0] == "error"]
+    assert not err
+
+
+def test_order_429_exhausts_retries_then_fails(
+    cfg, positions, journal, exchange, outcome_fill, market_meta, monkeypatch
+):
+    """All 3 attempts hit 429 → propagate OrderError, alert fires, journal
+    records order_failed (matches the original no-retry contract)."""
+    from src.errors import OrderError
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange.order.side_effect = [_client_error_429()] * 3
+    monkeypatch.setattr("src.mirror.time.sleep", lambda s: None)
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    with pytest.raises(OrderError):
+        mt.on_leader_fill("0xleader", outcome_fill)
+    assert exchange.order.call_count == 3
+    err = [c for c in alerter.alert.call_args_list if c.args[0] == "error"]
+    assert err
+
+
+def test_order_non_429_client_error_fails_fast(
+    cfg, positions, journal, exchange, outcome_fill, market_meta, monkeypatch
+):
+    """Other client errors (e.g. 400 bad order params) should NOT retry —
+    same payload would just fail again."""
+    from hyperliquid.utils.error import ClientError
+    from src.errors import OrderError
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange.order.side_effect = ClientError(400, None, "bad price", None, {})
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.mirror.time.sleep", lambda s: sleeps.append(s))
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    with pytest.raises(OrderError):
+        mt.on_leader_fill("0xleader", outcome_fill)
+    assert exchange.order.call_count == 1
+    assert sleeps == []
+
+
+def test_order_non_client_error_fails_fast(
+    cfg, positions, journal, exchange, outcome_fill, market_meta, monkeypatch
+):
+    """Ambiguous failures (timeout, network) should NOT retry — order may
+    have actually been placed mid-failure; retry would double-submit."""
+    from src.errors import OrderError
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange.order.side_effect = TimeoutError("network timeout")
+    sleeps: list[float] = []
+    monkeypatch.setattr("src.mirror.time.sleep", lambda s: sleeps.append(s))
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    with pytest.raises(OrderError):
+        mt.on_leader_fill("0xleader", outcome_fill)
+    assert exchange.order.call_count == 1
+    assert sleeps == []
+
+
+def test_order_retry_records_only_one_order_result_event(
+    cfg, positions, journal, exchange, outcome_fill, market_meta, monkeypatch
+):
+    """After 1 retry succeeds, exactly ONE order_result event in the journal
+    (no duplicate from retried attempts)."""
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange.order.side_effect = [
+        _client_error_429(),
+        {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}},
+    ]
+    monkeypatch.setattr("src.mirror.time.sleep", lambda s: None)
+    captured: list = []
+    real_write = journal.write
+
+    def capture(event, **kw):
+        captured.append(event)
+        real_write(event, **kw)
+
+    journal.write = capture  # type: ignore[method-assign]
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    assert captured.count("order_result") == 1
+    assert captured.count("order_failed") == 0

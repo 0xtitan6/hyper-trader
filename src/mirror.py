@@ -4,6 +4,8 @@ import time
 from dataclasses import asdict, dataclass, replace
 from threading import Lock
 
+from hyperliquid.utils.error import ClientError
+
 from .alerts import Alerter
 from .config import Config
 from .errors import OrderError
@@ -31,6 +33,15 @@ class TradeIntent:
 # longer than typical HL WS round-trip (~100-500ms) but short enough that a
 # stuck or rejected order doesn't permanently inflate our exposure estimate.
 IN_FLIGHT_TTL_SECONDS = 30.0
+
+# Order submit retry config. HL rate-limits the /exchange endpoint per-account
+# at sub-second granularity; a leader firing 5+ child orders in 1s can trip
+# the limiter (live cost 2026-05-30: 6 missed fills today from one ZEC burst).
+# Only retry on 429 — other exceptions are ambiguous (timeout-mid-request
+# might have placed the order). 2 retries with exp backoff caps total latency
+# at ~3s in the worst case.
+ORDER_RETRY_MAX_ATTEMPTS = 3   # 1 initial + 2 retries
+ORDER_RETRY_BASE_BACKOFF_S = 1.0
 
 
 class MirrorTrader:
@@ -339,6 +350,74 @@ class MirrorTrader:
             )
         return True, ""
 
+    def _submit_with_retry(
+        self, intent: TradeIntent, px: float, leader: str, tid: object
+    ) -> dict:
+        """Wrap exchange.order() with retry on 429. Caller is `_submit` —
+        runs inside `_submit_lock` so no concurrent retry storms.
+
+        Why only 429: HL responds 429 BEFORE the order is placed (rejected at
+        the rate-limit gate), so retry is safe — no risk of double-submit.
+        Network timeouts mid-request, by contrast, are ambiguous (order may
+        or may not have reached the matching engine), so we fail loud and
+        let the operator decide.
+
+        On final failure, raises OrderError exactly like the original
+        no-retry path — caller-side journal+alert behavior is unchanged.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(ORDER_RETRY_MAX_ATTEMPTS):
+            try:
+                result = self.exchange.order(
+                    intent.coin,
+                    intent.is_buy,
+                    intent.sz,
+                    px,
+                    order_type={"limit": {"tif": "Ioc"}},
+                    reduce_only=intent.reduce_only,
+                )
+            except ClientError as e:
+                last_exc = e
+                status = getattr(e, "status_code", None)
+                # Some wrappers stash the code as args[0]
+                if status is None and e.args:
+                    candidate = e.args[0]
+                    if isinstance(candidate, int):
+                        status = candidate
+                if status == 429 and attempt + 1 < ORDER_RETRY_MAX_ATTEMPTS:
+                    backoff = ORDER_RETRY_BASE_BACKOFF_S * (2**attempt)
+                    log.warning(
+                        "Order 429 on %s (attempt %d/%d); sleeping %.1fs",
+                        intent.coin, attempt + 1, ORDER_RETRY_MAX_ATTEMPTS, backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                # Non-retryable status (or budget exhausted) — fall through to raise
+                break
+            except Exception as e:
+                # Non-ClientError: ambiguous (timeout, connection) → fail fast.
+                # Don't retry — could double-submit a placed order.
+                last_exc = e
+                break
+            else:
+                # Success — caller (_submit) handles in-flight tracking +
+                # journaling.
+                return result
+
+        # All attempts exhausted or non-retryable failure
+        assert last_exc is not None
+        self.alerter.alert(
+            "error", f"Order submit failed: {type(last_exc).__name__}: {last_exc}"
+        )
+        self.journal.write(
+            "order_failed",
+            leader=leader,
+            tid=tid,
+            intent=asdict(intent),
+            error=str(last_exc),
+        )
+        raise OrderError(f"order failed: {last_exc}") from last_exc
+
     def _submit(self, intent: TradeIntent, leader: str, tid: object) -> None:
         if self.cfg.risk.dry_run:
             log.info(
@@ -367,25 +446,7 @@ class MirrorTrader:
             intent.notional_usd,
             intent.reduce_only,
         )
-        try:
-            result = self.exchange.order(
-                intent.coin,
-                intent.is_buy,
-                intent.sz,
-                px,
-                order_type={"limit": {"tif": "Ioc"}},
-                reduce_only=intent.reduce_only,
-            )
-        except Exception as e:
-            self.alerter.alert("error", f"Order submit failed: {type(e).__name__}: {e}")
-            self.journal.write(
-                "order_failed",
-                leader=leader,
-                tid=tid,
-                intent=asdict(intent),
-                error=str(e),
-            )
-            raise OrderError(f"order failed: {e}") from e
+        result = self._submit_with_retry(intent, px, leader, tid)
         # Track this order's notional as in-flight until own-fill confirms via
         # PositionTracker. _submit is called inside _submit_lock so it's safe
         # to mutate _in_flight here without an additional lock acquire.
