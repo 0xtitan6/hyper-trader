@@ -194,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         auto_close=cfg.risk.leader_exit_auto_close,
         debounce_cycles=cfg.risk.leader_exit_debounce_cycles,
         slippage_bps=cfg.sizing.ioc_slippage_bps,
+        manual_holdings=cfg.risk.manual_holdings,
     )
 
     funding_history = FundingHistory(state)
@@ -229,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     last_leader_recon = time.time()
     last_funding_poll = time.time()
     last_hip3_refresh = time.time()
+    last_outcome_refresh = time.time()
     last_thesis_cycle = time.time()
     reconcile_interval_s = 300  # 5 min — picks up HIP-4 settlement + manual trades
     leader_recon_interval_s = 300  # 5 min — detect leader exits we missed via WS
@@ -240,6 +242,12 @@ def main(argv: list[str] | None = None) -> int:
     # 2026-05-28 xyz:QNT). re-register every 30 min is cheap (2 small HTTP
     # calls per dex) and idempotent (set_perp_meta overwrites existing entries).
     hip3_refresh_interval_s = 1800
+    # HIP-4 outcomes (#NN coin names) follow the same dynamic-registration
+    # pattern as HIP-3. New outcome markets get added by HL between bot starts
+    # (live cost 2026-06-02 #1420 NBA Finals — leader_reconcile auto-close
+    # looped on KeyError every 5 min). Refresh every 10 min — outcomes are
+    # created more frequently than builder-dex symbols.
+    outcome_refresh_interval_s = 600
     log.info("Following %d leaders. Send SIGINT/SIGTERM to stop.", len(leaders))
     try:
         while not stop.is_set():
@@ -284,6 +292,20 @@ def main(argv: list[str] | None = None) -> int:
                         )
                 except Exception:
                     log.exception("HIP-3 periodic refresh failed")
+            if now - last_outcome_refresh >= outcome_refresh_interval_s:
+                last_outcome_refresh = now
+                try:
+                    prev_count = len(getattr(info, "coin_to_asset", {}))
+                    register_outcome_assets(info)
+                    register_outcome_assets(exchange.info)
+                    new_count = len(getattr(info, "coin_to_asset", {}))
+                    if new_count != prev_count:
+                        log.info(
+                            "Outcome refresh: coin map %d → %d (gained %d new legs)",
+                            prev_count, new_count, new_count - prev_count,
+                        )
+                except Exception:
+                    log.exception("Outcome periodic refresh failed")
             if now - last_refresh < cfg.discovery.refresh_seconds:
                 continue
             last_refresh = now
