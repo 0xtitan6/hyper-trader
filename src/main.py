@@ -16,6 +16,9 @@ from .errors import PreflightError
 from .follower import FillFollower
 from .funding_history import FundingHistory
 from .leader_reconcile import LeaderReconciler
+from .pref_client import PrefClient
+from .thesis import ThesisCache
+from .thesis_generator import ThesisGenerator
 from .ws_health import WSHealthMonitor
 from .funding import FundingTracker
 from .hl_hip3 import register_hip3_dexes
@@ -203,6 +206,24 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         log.exception("FundingHistory startup backfill failed")
 
+    # Thesis generator — writes per-coin BULL/BEAR/NEUTRAL stances to the
+    # ThesisCache using funding + cross-leader concordance. No live trading
+    # impact yet (MirrorTrader doesn't consult the cache); operator can
+    # inspect via `python -m src.thesis_cli list` to validate output quality
+    # before we wire the filter into the hot path (separate PR).
+    thesis_cache = ThesisCache(state)
+    # PrefClient is a soft dependency — if credentials missing or PREF is
+    # down, the generator silently runs without sentiment enrichment.
+    pref_client = PrefClient()
+    thesis_generator = ThesisGenerator(
+        info=info,
+        state=state,
+        cache=thesis_cache,
+        leader_addresses=[t.address for t in leaders],
+        ttl_s=900,  # 15 min — 50% longer than cycle so missed cycle doesn't blank cache
+        pref_client=pref_client,
+    )
+
     stop = install_signal_handler()
     last_refresh = time.time()
     last_reconcile = time.time()
@@ -210,9 +231,11 @@ def main(argv: list[str] | None = None) -> int:
     last_funding_poll = time.time()
     last_hip3_refresh = time.time()
     last_outcome_refresh = time.time()
+    last_thesis_cycle = time.time()
     reconcile_interval_s = 300  # 5 min — picks up HIP-4 settlement + manual trades
     leader_recon_interval_s = 300  # 5 min — detect leader exits we missed via WS
     funding_poll_interval_s = 3600  # 1 hour — matches HL's funding accrual cycle
+    thesis_cycle_interval_s = 600  # 10 min — generate fresh BULL/BEAR/NEUTRAL per coin
     # HIP-3 builder dexes (xyz, flx, etc.) add new symbols over time. Without
     # periodic re-registration, exchange.order("xyz:NEW_SYMBOL", ...) raises
     # KeyError on anything added after startup (live cost 2026-05-23 xyz:NVDA,
@@ -243,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
                     leader_reconciler.reconcile(follower.addresses)
                 except Exception:
                     log.exception("Leader reconcile failed")
+            if now - last_thesis_cycle >= thesis_cycle_interval_s:
+                last_thesis_cycle = now
+                try:
+                    thesis_generator.run_cycle()
+                except Exception:
+                    log.exception("Thesis generator cycle failed")
             if now - last_funding_poll >= funding_poll_interval_s:
                 last_funding_poll = now
                 try:
@@ -289,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
                     log.info("Adding %d new leaders to follow set", len(added))
                     follower.follow(sorted(added))
                 mirror.update_leader_weights({t.address: t.weight for t in refreshed})
+                thesis_generator.update_leaders([t.address for t in refreshed])
                 if cfg.sizing.use_funding_aware_sizing:
                     funding.refresh()
                 leaders = refreshed
