@@ -8,6 +8,100 @@ The point of this document is the same as `CAPITAL_LADDER.md`: be loud about dis
 
 ## Long-term system features
 
+### Per-position stop-loss
+**What:** Configurable percentage-based drawdown trigger per position. When unrealized loss exceeds `risk.position_stop_loss_pct` of cost-basis notional, submit reduce_only IOC to flatten. Default OFF; operator opts in.
+
+**Why:** Discussed 3 times (2026-05-26, 2026-05-27, 2026-05-30). Live cost on PURR + LIT: open positions sit at −15-25% from entry for days while leaders average down. NEAR locked −$8 loss when leader exit finally fired at the bottom — a −10% stop would have cut it at ~−$3.
+
+**Where:** New module `src/stop_loss.py` (periodic check) or integrate into the existing 5-min reconcile loop. Use `LeaderReconciler`'s on-chain leader-position fetch as defense — if leader is *flat*, close at stop instantly; if leader is still in, give them slack until stop trigger.
+
+**Backtest first:** Extend `src/backtest.py` with `--stop-loss-pct` arg, replay last 30d at -5/-10/-15/-20% thresholds. Pick the one that improves net realized. Without this data, threshold choice is guessing.
+
+**Stage gate:** Ship anytime — operator-controlled risk parameter, not a strategy change. Defaults OFF until backtest validates threshold.
+
+**Engineering estimate:** ~2 hours including tests + backtest extension.
+
+---
+
+### MirrorTrader thesis hook (#42)
+**What:** Consult the per-coin thesis cache from `MirrorTrader._build_intent` to apply AMPLIFY / MIRROR / VETO logic:
+- BULL stance + leader BUY → MIRROR (or AMPLIFY × 1.3 at confidence ≥ 0.7)
+- BULL + leader SELL → VETO
+- BEAR + leader SELL → MIRROR (or AMPLIFY at confidence ≥ 0.7)
+- BEAR + leader BUY → VETO
+- NEUTRAL or no cache entry → MIRROR (no opinion)
+
+**Why:** Layer 4 of the thesis stack started in PR #37/#38/#39. Without the hook, the cache populates but doesn't gate trades. This is what makes the thesis layer actually impact P&L.
+
+**Where:** `src/mirror.py`, new config flag `mirror.thesis_filter_enabled: bool = False`.
+
+**Stage gate:** Ship after generator output validates against live signals for 1-2 weeks. Default OFF.
+
+**Engineering estimate:** ~1 day including tests + careful integration.
+
+---
+
+### Restart resilience — preflight retry on 429
+**What:** When the bot's startup `Info()` constructor or preflight hits HL 429 rate limit, retry with backoff instead of crashing. Currently a single 429 kills startup (live cost 2026-05-29: 30 min downtime after a restart attempt during rapid PnL queries hammered HL).
+
+**Where:** `src/main.py` startup section, wrap `Info()` construction in retry loop. Could also catch `ClientError(429)` and back off.
+
+**Stage gate:** Ship anytime — pure resilience improvement, no behavior change in steady state.
+
+**Engineering estimate:** ~1 hour.
+
+---
+
+### Funding-aware P&L reporting
+**What:** Roll up `funding_events` table into all P&L reports. Currently `daily_pnl()` and lifetime queries only sum `closed_pnl - fee` from `own_fills`. Funding accrual is recorded but never surfaces.
+
+**Why:** Closes the books gap between our DB-only realized number and HL portfolio view. At Stage 3+ scale funding becomes a real income stream worth reporting separately.
+
+**Where:** Extend `state.daily_pnl` to optionally include funding, OR add new method `state.daily_pnl_with_funding`. Update operator queries.
+
+**Stage gate:** Anytime.
+
+**Engineering estimate:** ~2 hours.
+
+---
+
+### Account-value-aware sizing
+**What:** Replace fixed `account_proxy` baseline in proportional sizing with live account-value lookup. Currently sizing is `fraction × static_base × weight` — as the account grows, sizing doesn't grow with it until operator manually bumps caps.
+
+**Why:** Account has grown $590 → $670+ during Stage 1, but sizing logic still uses the same base. Compounding the strategy as it earns is structurally the right move.
+
+**Where:** `src/mirror.py:_build_intent` — query `positions.total_account_value()` instead of hardcoded base.
+
+**Stage gate:** Stage 2+ (need stable strategy first).
+
+**Engineering estimate:** ~3 hours including tests.
+
+---
+
+### Operator PnL/status CLI
+**What:** `python -m src.status` — one-shot CLI that prints current positions with mark-to-market unrealized, today's realized, account value, cap utilization. Replaces ad-hoc Python queries.
+
+**Why:** Operator (or me from a fresh session) asks for PnL 10+ times/day. Each one is an ad-hoc Python script. A maintained tool is faster and less error-prone.
+
+**Where:** New `src/status_cli.py`, similar pattern to `thesis_cli.py`.
+
+**Stage gate:** Anytime — operator tooling.
+
+**Engineering estimate:** ~2 hours.
+
+---
+
+### HL Vault deployment (endgame)
+**What:** Deploy hyper-trader as a Hyperliquid vault contract. Other users deposit USDC, vault contract runs our strategy, depositors get pro-rata share of P&L minus 5% performance fee.
+
+**Why:** Strategy capital efficiency × N depositors instead of just our own bag. Permissionless — no fund formation, no KYC for the manager, no LP agreements. Discussed 2026-05-27 (X tweet from college_xyz).
+
+**Stage gate:** Stage 3+. Need 100 closed trades + 4 profitable weeks + max drawdown < 15% as the public-facing proof. Regulatory concerns (US-based operators) need review.
+
+**Engineering estimate:** Probably 1-2 weeks. Need to wrap the bot's trading wallet in vault contract calls.
+
+---
+
 ### MCP read-only data layer
 **What:** Wrap `hl-info`, `liquidiction`, and `hyper-trader-state` as MCP servers so an LLM operator (me, or Cowork) can query account state, leader scoring, and journal P&L without writing ad-hoc Python every shift. Read-only — no order placement.
 
@@ -295,4 +389,35 @@ When evaluating any of these for activation:
 
 ---
 
-*Last updated: 2026-05-08. Add new entries with stage gate, source, engineering estimate. When something gets implemented, move it to a "Shipped" section at the bottom rather than deleting (audit trail of what we considered).*
+*Last updated: 2026-05-30. Add new entries with stage gate, source, engineering estimate. When something gets implemented, move it to the Shipped section below.*
+
+---
+
+## Shipped — audit trail of what made it from backlog → production
+
+Reverse-chronological. Each entry records the original backlog idea and the PR(s) that shipped it.
+
+| Date | Idea | Shipped as | Live? |
+|---|---|---|---|
+| 2026-05-28 | Periodic HIP-3 dex re-registration | **PR #40** | ✅ on main |
+| 2026-05-27 | PREF MCP fear/greed sentiment in thesis evidence | **PR #39** | 🟡 merged to feature branch; PR #41 forward-merges to main |
+| 2026-05-25 | Rule-based thesis generator (funding + cross-leader concordance) | **PR #38** | 🟡 same as #39 |
+| 2026-05-24 | ThesisCache scaffolding + operator CLI | **PR #37** | ✅ on main, cache table exists |
+| 2026-05-23 | Leader-edge backtest tool | **PR #36** | ✅ on main, informed leader-drop config change |
+| 2026-05-23 | HIP-3 perp DEX asset registration | **PR #35** | ✅ on main |
+| 2026-05-22 | Funding-payment history tracking (state DB table + hourly poll) | **PR #34** | ✅ on main, +$0.94 lifetime captured |
+| 2026-05-21 | WS silent-degrade rebuild + replay subscriptions | **PR #33** | ✅ on main, prevents the 5-day-stale-position bug at root |
+| 2026-05-21 | `set_position_originator` race fix (INSERT-OR-UPDATE) | **PR #32** | ✅ on main |
+| 2026-05-21 | 24/7 watchdog (systemd service, Telegram on state transitions) | **PR #31** | ✅ on main, caught the 30-min journal-stale incident 2026-05-29 |
+| 2026-05-21 | LeaderReconciler — detect + close stale mirrors when leader exits | **PR #30** | ✅ on main, auto-close enabled |
+| 2026-05-15 | Per-coin weight-priority conflict lock (originator address) | **PR #25** | ✅ on main, prevents multi-leader whipsaw |
+| 2026-05-15 | Per-leader sizing weights (auto-Sharpe + explicit overrides) | **PR #18** | ✅ on main |
+| 2026-05-15 | Funding-aware mirror sizing | **PR #19** | ✅ on main (opt-in via config) |
+| 2026-05-08 | CAPITAL_LADDER.md discipline contract | **PR #20** | ✅ on main, actively consulted on cap raises |
+| 2026-05-06 | Leader-quality scorer (catches scalpers + flip-floppers) | **PR #13/#14/#15** | ✅ on main, perp-bias filter live |
+| 2026-05-05 | In-flight notional tally (closes exposure-cap race) | **PR #11** | ✅ on main |
+
+### Partial / superseded
+
+- **"Cross-leader concordance feature"** (original entry under quantitative strategies): partially absorbed into thesis generator's concordance rule (PR #38). Still listed as a separate entry because the original spec contemplated a richer signal (boost weight + size by convergence strength), not just BULL/BEAR/NEUTRAL.
+- **"MCP read-only data layer"**: adjacent solution — PREF MCP was onboarded 2026-05-23 giving me catalog access from this Claude Code session. The original idea (wrap *our own* state as MCP servers for cross-agent access) is still unshipped.
