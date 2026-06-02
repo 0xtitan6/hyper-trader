@@ -47,6 +47,7 @@ def _make_reconciler(
     debounce: int = 2,
     exchange: MagicMock | None = None,
     market_meta=None,
+    manual_holdings: list[str] | None = None,
 ) -> LeaderReconciler:
     return LeaderReconciler(
         info=_mock_info(leader_books),
@@ -58,6 +59,7 @@ def _make_reconciler(
         auto_close=auto_close,
         debounce_cycles=debounce,
         slippage_bps=50.0,
+        manual_holdings=manual_holdings,
     )
 
 
@@ -313,6 +315,73 @@ def test_auto_close_handles_order_exception(state, journal, market_meta):
         "auto-close order failed" in str(call.args[1])
         for call in r.alerter.alert.call_args_list
     )
+
+
+# --- manual holdings -------------------------------------------------------
+
+
+def test_manual_holdings_skipped_entirely(state, journal):
+    """Coin in manual_holdings never appears in status — no classification at
+    all, no debounce counter incremented, no alert."""
+    state.update_position("#1420", 31.0, 0.6372)
+    # No originator set — would normally be ORPHAN
+    r = _make_reconciler(
+        state, journal, {"0xabc": {}}, debounce=1, manual_holdings=["#1420"]
+    )
+    status = r.reconcile(["0xABC"])
+    assert "#1420" not in status
+    assert r._stale_counts == {}
+    r.alerter.alert.assert_not_called()
+
+
+def test_manual_holdings_case_insensitive(state, journal):
+    state.update_position("xyz:SPCX", 0.19, 200.0)
+    r = _make_reconciler(
+        state, journal, {"0xabc": {}}, debounce=1, manual_holdings=["XYZ:spcx"]
+    )
+    status = r.reconcile(["0xABC"])
+    assert "xyz:SPCX" not in status
+
+
+def test_manual_holdings_does_not_block_other_coins(state, journal):
+    """Non-manual positions still get classified normally."""
+    state.update_position("#1420", 31.0, 0.6372)
+    state.update_position("BTC", -0.5, 60000.0)
+    state.set_position_originator("BTC", "0xABC")
+    r = _make_reconciler(
+        state, journal, {"0xabc": {}}, debounce=1, manual_holdings=["#1420"]
+    )
+    status = r.reconcile(["0xABC"])
+    assert "#1420" not in status
+    assert status["BTC"] == STATUS_CLOSED
+
+
+def test_manual_holdings_blocks_auto_close(state, journal, market_meta):
+    """Even with auto_close=True, manual holdings are never submitted to
+    exchange. This is the live bug from 2026-06-02."""
+    state.update_position("#1420", 31.0, 0.6372)
+    exchange = MagicMock()
+    r = _make_reconciler(
+        state,
+        journal,
+        {"0xabc": {}},
+        auto_close=True,
+        debounce=1,
+        exchange=exchange,
+        market_meta=market_meta,
+        manual_holdings=["#1420"],
+    )
+    r.reconcile(["0xABC"])
+    exchange.order.assert_not_called()
+
+
+def test_manual_holdings_none_defaults_to_empty(state, journal):
+    """Passing manual_holdings=None preserves prior behavior (no skips)."""
+    state.update_position("BTC", -0.5, 60000.0)
+    state.set_position_originator("BTC", "0xABC")
+    r = _make_reconciler(state, journal, {"0xabc": {}}, debounce=1, manual_holdings=None)
+    status = r.reconcile(["0xABC"])
+    assert status["BTC"] == STATUS_CLOSED
 
 
 # --- reset utility ---------------------------------------------------------
