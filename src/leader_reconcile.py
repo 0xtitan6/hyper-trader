@@ -62,6 +62,7 @@ class LeaderReconciler:
         auto_close: bool = False,
         debounce_cycles: int = 2,
         slippage_bps: float = 50.0,
+        manual_holdings: list[str] | None = None,
     ):
         self.info = info
         self.state = state
@@ -72,6 +73,9 @@ class LeaderReconciler:
         self.auto_close = auto_close
         self.debounce_cycles = debounce_cycles
         self.slippage_bps = slippage_bps
+        # Operator-managed positions to skip entirely. Stored lowercase for
+        # case-insensitive match.
+        self.manual_holdings: set[str] = {c.lower() for c in (manual_holdings or [])}
         # coin -> consecutive stale cycles
         self._stale_counts: dict[str, int] = {}
 
@@ -89,6 +93,8 @@ class LeaderReconciler:
         status: dict[str, str] = {}
         for coin, (our_sz, _our_avg) in self.state.get_positions().items():
             if our_sz == 0:
+                continue
+            if coin.lower() in self.manual_holdings:
                 continue
             originator = self.state.get_position_originator(coin)
             status[coin] = self._classify(coin, our_sz, originator, leader_positions)

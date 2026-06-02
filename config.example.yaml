@@ -22,6 +22,12 @@ risk:
   max_daily_loss_usd: 100
   allowed_market_types: [outcome]   # outcome | perp | spot
   kill_switch_file: ./KILL
+  # Manual positions opened outside the bot (e.g. discretionary outcome bets,
+  # hand-traded HIP-3 names). LeaderReconciler skips these so they're never
+  # flagged as orphans or auto-closed. Case-insensitive coin-name match.
+  # manual_holdings:
+  #   - "#1420"      # example: a manual outcome bet
+  #   - "xyz:SPCX"   # example: a manual HIP-3 long
 
 network:
   hyperliquid_env: testnet

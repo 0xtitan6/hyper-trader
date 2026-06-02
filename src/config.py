@@ -89,6 +89,14 @@ class RiskConfig:
     # detection cycles (5-min cadence) required before acting; 2 = ~10 min.
     leader_exit_auto_close: bool = False
     leader_exit_debounce_cycles: int = 2
+    # Operator-managed positions opened outside the bot (manual HIP-4 outcome
+    # bets, discretionary HIP-3 trades). LeaderReconciler skips these entirely
+    # — they have no recorded originator leader so the orphan check would flag
+    # them every cycle and, with auto_close=True, would actually flatten them.
+    # Match coin name exactly (case-insensitive). Live cost 2026-06-02:
+    # KeyError loop on #1420 (Spurs Finals bet) was only prevented from
+    # auto-closing a manual trade by an unrelated missing-asset registration.
+    manual_holdings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -200,6 +208,11 @@ def load_config(path: str = "config.yaml", env: dict[str, str] | None = None) ->
         raise SystemExit(f"risk.allowed_market_types contains invalid entries: {bad}")
     if not risk.allowed_market_types:
         raise SystemExit("risk.allowed_market_types must list at least one market type")
+    for coin in risk.manual_holdings:
+        if not isinstance(coin, str) or not coin.strip():
+            raise SystemExit(
+                f"risk.manual_holdings entries must be non-empty strings, got {coin!r}"
+            )
 
     discovery = DiscoveryConfig(**raw["discovery"])
     if discovery.top_n < 1 or discovery.top_n > 9:
