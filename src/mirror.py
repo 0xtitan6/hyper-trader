@@ -537,15 +537,36 @@ class MirrorTrader:
                 )
             return False
 
-        # Accepted (rested/filled): reserve notional as in-flight until the
-        # own-fill confirmation propagates through PositionTracker. _submit runs
-        # inside _submit_lock so mutating _in_flight here needs no extra lock.
-        self._in_flight.append((time.time() + IN_FLIGHT_TTL_SECONDS, intent.notional_usd))
-        self.journal.write(
-            "order_result",
-            leader=leader,
-            tid=tid,
-            intent=asdict(intent),
-            result=result,
-        )
+        # Accepted (rested/filled): the order is now LIVE on the exchange. Any
+        # error past this point (in-flight bookkeeping, journal write) must NOT
+        # propagate — an exception here escapes _submit -> on_leader_fill's
+        # `except Exception`, which unmarks the tid and lets backfill re-dispatch
+        # the SAME leader fill, placing a duplicate live order (double-trade).
+        # journal.write does open()+write() on every call, so a transient FS
+        # fault (ENOSPC/EDQUOT/EROFS/EMFILE/permission) can raise here. Swallow
+        # and alert instead: the order is already placed, so returning True (tid
+        # stays marked) is the only safe outcome.
+        try:
+            # reserve notional as in-flight until the own-fill confirmation
+            # propagates through PositionTracker. _submit runs inside
+            # _submit_lock so mutating _in_flight here needs no extra lock.
+            self._in_flight.append((time.time() + IN_FLIGHT_TTL_SECONDS, intent.notional_usd))
+            self.journal.write(
+                "order_result",
+                leader=leader,
+                tid=tid,
+                intent=asdict(intent),
+                result=result,
+            )
+        except Exception:
+            log.exception(
+                "Post-submit bookkeeping failed (order is LIVE) leader=%s tid=%s coin=%s",
+                leader, tid, intent.coin,
+            )
+            self.alerter.alert(
+                "critical",
+                f"Post-submit bookkeeping failed but order is LIVE "
+                f"leader={leader[:10]} tid={tid} coin={intent.coin} — tid stays "
+                f"marked to prevent double-trade",
+            )
         return True
