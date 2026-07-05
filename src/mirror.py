@@ -43,6 +43,18 @@ IN_FLIGHT_TTL_SECONDS = 30.0
 ORDER_RETRY_MAX_ATTEMPTS = 3   # 1 initial + 2 retries
 ORDER_RETRY_BASE_BACKOFF_S = 1.0
 
+# HL rejects some orders IN-BAND: HTTP 200 with the error nested in the body
+# ({'status':'ok','response':{'data':{'statuses':[{'error':'Order has invalid
+# size.'}]}}}). These never rest or fill. Two failures follow if we ignore it:
+#   1. in_flight leak — we reserve notional that only clears on TTL, leaking
+#      phantom exposure that eats the cap (observed 2026-06-29: $440 phantom).
+#   2. API storm — the HIP-3 `xyz:` equity perps reject EVERY open on szDecimals
+#      ("invalid size"), and the mirror re-fires per leader child-fill, so one
+#      leader burst becomes hundreds of doomed submits (668 rejects in 4h).
+# Structural per-coin errors below get the coin cooled down; others just skip.
+POISON_COOLDOWN_SECONDS = 300.0
+_POISON_ORDER_ERRORS = ("invalid size", "invalid price")
+
 
 class MirrorTrader:
     def __init__(
@@ -72,6 +84,9 @@ class MirrorTrader:
         # (Real-world bug: 19 fills bypassed a $60 cap and produced a 5x XMR
         # leverage runaway on 2026-05-05.) Each entry: (expires_at, notional).
         self._in_flight: list[tuple[float, float]] = []
+        # Coins under a structural-rejection cooldown (bad szDecimals → repeated
+        # "invalid size"). coin -> unix ts until which new opens are skipped.
+        self._poison_until: dict[str, float] = {}
         # Per-leader sizing weight, refreshed every discover_leaders cycle.
         # Default 1.0 = original proportional sizing. Updated via
         # update_leader_weights() from main's refresh loop.
@@ -139,10 +154,12 @@ class MirrorTrader:
                         "[risk] reject (%s) leader=%s coin=%s", reason, leader[:10], intent.coin
                     )
                     return
-                self._submit(intent, leader, tid)
-                # Record this leader as the position's originator. Done
-                # post-submit so a failed order doesn't claim the coin.
-                self.positions.state.set_position_originator(intent.coin, leader)
+                submitted = self._submit(intent, leader, tid)
+                # Record this leader as the position's originator only if the
+                # order was actually accepted — a rejected order must not claim
+                # the coin (else conflict-lock blocks the real originator).
+                if submitted:
+                    self.positions.state.set_position_originator(intent.coin, leader)
         except OrderError:
             raise
         except Exception:
@@ -333,8 +350,15 @@ class MirrorTrader:
             return False, f"daily_loss_cap (net={net_realized:.2f})"
 
         # Reduce-only orders shrink, never grow exposure — bypass the cap.
+        # (Also bypasses the poison cooldown below: exits must always be allowed
+        # so a poisoned coin can still be closed if we somehow hold it.)
         if intent.reduce_only:
             return True, ""
+
+        # Coin in structural-rejection cooldown (see _POISON_ORDER_ERRORS). Skip
+        # opens so we don't storm the API with orders that can't succeed.
+        if self._poison_until.get(intent.coin, 0.0) > time.time():
+            return False, f"poison_cooldown ({intent.coin})"
 
         exposure = self.positions.total_exposure_usd()
         in_flight = self._in_flight_notional()
@@ -418,7 +442,34 @@ class MirrorTrader:
         )
         raise OrderError(f"order failed: {last_exc}") from last_exc
 
-    def _submit(self, intent: TradeIntent, leader: str, tid: object) -> None:
+    @staticmethod
+    def _order_status_error(result: object) -> str | None:
+        """Return HL's in-band rejection message, or None if the order was
+        accepted (rested or filled).
+
+        HL returns HTTP 200 even when it rejects an order — the reason is nested
+        in the body. Two shapes:
+          - {'status': 'err', 'response': '<message>'}
+          - {'status': 'ok', 'response': {'data': {'statuses': [{'error': ...}]}}}
+        A status dict with 'resting' or 'filled' (and no 'error') is a success.
+        """
+        if not isinstance(result, dict):
+            return None
+        if result.get("status") == "err":
+            resp = result.get("response")
+            return str(resp) if resp else "unknown error"
+        response = result.get("response")
+        if not isinstance(response, dict):
+            return None
+        data = response.get("data")
+        if not isinstance(data, dict):
+            return None
+        for st in data.get("statuses") or []:
+            if isinstance(st, dict) and st.get("error"):
+                return str(st["error"])
+        return None
+
+    def _submit(self, intent: TradeIntent, leader: str, tid: object) -> bool:
         if self.cfg.risk.dry_run:
             log.info(
                 "[DRY] %s %s %.6f @ %.4f notional=$%.2f reduce_only=%s leader=%s tid=%s",
@@ -432,7 +483,7 @@ class MirrorTrader:
                 tid,
             )
             self.journal.write("order_dry_run", leader=leader, tid=tid, intent=asdict(intent))
-            return
+            return True
 
         slip = self.cfg.sizing.ioc_slippage_bps / 10_000.0
         slipped_px = intent.limit_px * (1 + slip if intent.is_buy else 1 - slip)
@@ -447,11 +498,37 @@ class MirrorTrader:
             intent.reduce_only,
         )
         result = self._submit_with_retry(intent, px, leader, tid)
-        # Track this order's notional as in-flight until own-fill confirms via
-        # PositionTracker. _submit is called inside _submit_lock so it's safe
-        # to mutate _in_flight here without an additional lock acquire.
-        self._in_flight.append((time.time() + IN_FLIGHT_TTL_SECONDS, intent.notional_usd))
         log.info("Order result: %s", result)
+
+        # HL may reject in-band (HTTP 200 + error in body). A rejected order
+        # never rests or fills, so it must NOT reserve in-flight notional —
+        # doing so leaks phantom exposure that only clears on TTL (2026-06-29:
+        # $440 phantom ate the cap). Return False so the caller doesn't claim
+        # the coin's originator slot.
+        err = self._order_status_error(result)
+        if err is not None:
+            log.warning("Order rejected in-band on %s: %s", intent.coin, err)
+            self.alerter.alert("warn", f"Order rejected {intent.coin}: {err}")
+            self.journal.write(
+                "order_rejected",
+                leader=leader,
+                tid=tid,
+                intent=asdict(intent),
+                error=err,
+                result=result,
+            )
+            if any(p in err.lower() for p in _POISON_ORDER_ERRORS):
+                self._poison_until[intent.coin] = time.time() + POISON_COOLDOWN_SECONDS
+                log.warning(
+                    "Coin %s poisoned for %.0fs (%s)",
+                    intent.coin, POISON_COOLDOWN_SECONDS, err,
+                )
+            return False
+
+        # Accepted (rested/filled): reserve notional as in-flight until the
+        # own-fill confirmation propagates through PositionTracker. _submit runs
+        # inside _submit_lock so mutating _in_flight here needs no extra lock.
+        self._in_flight.append((time.time() + IN_FLIGHT_TTL_SECONDS, intent.notional_usd))
         self.journal.write(
             "order_result",
             leader=leader,
@@ -459,3 +536,4 @@ class MirrorTrader:
             intent=asdict(intent),
             result=result,
         )
+        return True
