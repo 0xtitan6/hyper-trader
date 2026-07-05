@@ -649,6 +649,31 @@ def test_order_failure_does_not_unmark_tid(
     positions.state.unmark_tid_seen.assert_not_called()
 
 
+def test_post_submit_error_does_not_unmark_tid(
+    cfg, positions, journal, exchange, outcome_fill, market_meta
+):
+    """A non-OrderError raised AFTER a live order was submitted (e.g. sqlite
+    'database is locked' in set_position_originator) must NOT unmark the tid.
+    The order is already live; unmarking would let backfill re-dispatch the
+    same leader fill and submit a duplicate order (double-trade)."""
+    import sqlite3
+
+    cfg2 = _override_risk(cfg, dry_run=False)
+    # _submit succeeds (order placed), then the post-submit DB write raises a
+    # plain OperationalError — NOT an OrderError.
+    positions.state.set_position_originator.side_effect = sqlite3.OperationalError(
+        "database is locked"
+    )
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)  # tid=1001
+
+    # The order WAS submitted...
+    exchange.order.assert_called_once()
+    # ...so the tid must stay marked — no unmark, no re-dispatch, no double-trade.
+    positions.state.unmark_tid_seen.assert_not_called()
+
+
 def test_outcome_min_overrides_global_min(
     cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
 ):
