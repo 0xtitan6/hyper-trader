@@ -102,6 +102,10 @@ class MirrorTrader:
 
     def on_leader_fill(self, leader: str, fill: dict) -> None:
         tid = fill.get("tid")
+        # Once _submit is entered, a live order may have been placed. Any
+        # failure AFTER this point must NOT unmark the tid, else backfill
+        # re-dispatches the same leader fill and double-trades.
+        submit_attempted = False
         try:
             self.journal.write(
                 "leader_fill",
@@ -154,6 +158,10 @@ class MirrorTrader:
                         "[risk] reject (%s) leader=%s coin=%s", reason, leader[:10], intent.coin
                     )
                     return
+                # Mark BEFORE the call: _submit places the live order internally,
+                # so if it raises (or anything after it does) the order may
+                # already exist and the tid must stay marked.
+                submit_attempted = True
                 submitted = self._submit(intent, leader, tid)
                 # Record this leader as the position's originator only if the
                 # order was actually accepted — a rejected order must not claim
@@ -169,9 +177,13 @@ class MirrorTrader:
                 f"Mirror pipeline exception leader={leader[:10]} tid={tid}",
             )
             self.journal.write("pipeline_error", leader=leader, tid=tid)
-            # Unmark so backfill can re-dispatch this fill. OrderError stays
-            # marked (the order was attempted; retrying could double-trade).
-            if isinstance(tid, int):
+            # Unmark so backfill can re-dispatch this fill — but ONLY if the
+            # failure happened before we entered _submit. Once _submit runs a
+            # live order may have been placed (regardless of OrderError vs a
+            # plain exception from set_position_originator / journal.write on
+            # the post-submit success path), so the tid must stay marked to
+            # avoid a duplicate order on the next backfill/re-dispatch.
+            if isinstance(tid, int) and not submit_attempted:
                 self.positions.state.unmark_tid_seen(tid)
 
     def _build_intent(self, fill: dict, leader: str = "") -> TradeIntent | None:
