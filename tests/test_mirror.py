@@ -649,6 +649,39 @@ def test_order_failure_does_not_unmark_tid(
     positions.state.unmark_tid_seen.assert_not_called()
 
 
+def test_post_submit_journal_error_keeps_tid_marked(
+    cfg, positions, alerter, exchange, outcome_fill, market_meta
+):
+    """A journal/bookkeeping OSError AFTER the order is live must NOT unmark the
+    tid. The order is already on the exchange; unmarking lets backfill
+    re-dispatch the same leader fill and place a duplicate live order.
+
+    Regression for the double-trade path: post-submit journal.write raises
+    OSError (ENOSPC/EROFS/etc.), which is not an OrderError, so it previously
+    escaped _submit -> on_leader_fill's `except Exception` -> unmark_tid_seen.
+    """
+    cfg2 = _override_risk(cfg, dry_run=False)
+
+    # Real order goes through (exchange.order returns ok), but the post-submit
+    # "order_result" journal write fails with a filesystem error.
+    journal = MagicMock()
+
+    def _write(event, **fields):
+        if event == "order_result":
+            raise OSError(28, "No space left on device")
+
+    journal.write.side_effect = _write
+
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    # Must not raise out of on_leader_fill.
+    mt.on_leader_fill("0xleader", outcome_fill)  # tid=1001
+
+    # The order was actually placed exactly once.
+    exchange.order.assert_called_once()
+    # Critically: the tid must stay marked so backfill does NOT re-dispatch it.
+    positions.state.unmark_tid_seen.assert_not_called()
+
+
 def test_outcome_min_overrides_global_min(
     cfg, positions, journal, alerter, exchange, outcome_fill, market_meta
 ):
