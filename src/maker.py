@@ -1376,10 +1376,24 @@ def main() -> int:
     p.add_argument("--max-position", type=float, default=20.0, help="Max long shares")
     p.add_argument("--max-inventory-usd", type=float, default=5.0, help="Max $ at risk")
     p.add_argument("--dry-run", action="store_true", help="Don't submit real orders")
+    p.add_argument("--account-address", default=None,
+                   help="Trade this account/subaccount instead of config's (signed by the "
+                        "same key). Use to run the maker on a separate HL subaccount, "
+                        "isolated from the mirror bot's account.")
+    p.add_argument("--kill-file", default=None,
+                   help="Kill-switch file for THIS maker (default: config's kill_switch_file). "
+                        "Give the maker its own so it doesn't share the mirror bot's ./KILL.")
     args = p.parse_args()
 
     cfg = load_config(args.config)
     setup_logging(level=cfg.ops.log_level, json_mode=cfg.ops.log_json)
+
+    # Subaccount isolation: let the maker target its own HL subaccount and its
+    # own kill-switch file, so it never collides with the live mirror bot's
+    # account or ./KILL. Signing key stays the master wallet (cfg.private_key);
+    # HL routes orders to `acct` when it's a subaccount the key controls.
+    acct = args.account_address or cfg.account_address
+    kill_file = args.kill_file or cfg.risk.kill_switch_file
 
     # skip_ws=False: we need the WS to receive our own fills (userFills). REST
     # (info.post) still works for l2Book polling regardless.
@@ -1390,7 +1404,7 @@ def main() -> int:
 
     journal = Journal(cfg.ops.journal_path)
     wallet = Account.from_key(cfg.private_key)
-    exchange = Exchange(wallet, cfg.hyperliquid_api_url, account_address=cfg.account_address)
+    exchange = Exchange(wallet, cfg.hyperliquid_api_url, account_address=acct)
     register_outcome_assets(exchange.info)
 
     expiry_ts = int(datetime.fromisoformat(args.expiry).timestamp())
@@ -1401,7 +1415,7 @@ def main() -> int:
         min_spread_bps=args.min_spread_bps,
         max_position_shares=args.max_position,
         max_inventory_usd=args.max_inventory_usd,
-        kill_switch_file=cfg.risk.kill_switch_file,
+        kill_switch_file=kill_file,
     )
     maker = OutcomeMaker(
         info=info,
@@ -1410,14 +1424,14 @@ def main() -> int:
         journal=journal,
         config=mk_cfg,
         dry_run=args.dry_run,
-        account_address=cfg.account_address,
+        account_address=acct,
     )
 
     # Wire own-fills → inventory tracking. Without this the maker is blind to
     # its own fills and never knows it holds a position. Even in dry-run we
     # subscribe (harmless: no real fills arrive), so the live/dry paths match.
     info.subscribe(
-        {"type": "userFills", "user": cfg.account_address},
+        {"type": "userFills", "user": acct},
         maker.handle_ws_fills,
     )
 
