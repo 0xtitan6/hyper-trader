@@ -956,3 +956,70 @@ def test_order_retry_records_only_one_order_result_event(
     mt.on_leader_fill("0xleader", outcome_fill)
     assert captured.count("order_result") == 1
     assert captured.count("order_failed") == 0
+
+
+# --- in-band rejection / in_flight leak / poison cooldown (2026-06-29 fix) ---
+
+INVALID_SIZE_RESULT = {
+    "status": "ok",
+    "response": {"type": "order", "data": {"statuses": [{"error": "Order has invalid size."}]}},
+}
+RESTING_RESULT = {
+    "status": "ok",
+    "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 7}}]}},
+}
+
+
+def test_order_status_error_detects_shapes():
+    f = MirrorTrader._order_status_error
+    # accepted → None
+    assert f({"status": "ok"}) is None
+    assert f(RESTING_RESULT) is None
+    assert f({"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "1"}}]}}}) is None
+    assert f("not-a-dict") is None
+    # rejected → message
+    assert f(INVALID_SIZE_RESULT) == "Order has invalid size."
+    assert f({"status": "err", "response": "nonce too low"}) == "nonce too low"
+
+
+def test_inband_rejection_does_not_reserve_in_flight(
+    cfg, positions, journal, outcome_fill, market_meta
+):
+    """The $440-phantom leak: a rejected order must not reserve in-flight."""
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange = MagicMock()
+    exchange.order.return_value = INVALID_SIZE_RESULT
+    alerter = MagicMock()
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    exchange.order.assert_called_once()          # order was attempted...
+    assert mt._in_flight == []                   # ...but reserved no exposure
+    positions.state.set_position_originator.assert_not_called()  # didn't claim coin
+    assert any(c.args[0] == "warn" for c in alerter.alert.call_args_list)
+
+
+def test_invalid_size_poisons_coin_and_skips_second_open(
+    cfg, positions, journal, alerter, outcome_fill, market_meta
+):
+    """The API storm: after 'invalid size', further opens on the coin are skipped."""
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange = MagicMock()
+    exchange.order.return_value = INVALID_SIZE_RESULT
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    assert "#11" in mt._poison_until
+    mt.on_leader_fill("0xleader", {**outcome_fill, "tid": 1002})
+    exchange.order.assert_called_once()          # second open never submitted
+
+
+def test_accepted_order_reserves_in_flight(
+    cfg, positions, journal, alerter, outcome_fill, market_meta
+):
+    """Regression: an accepted (resting) order still reserves in-flight."""
+    cfg2 = _override_risk(cfg, dry_run=False)
+    exchange = MagicMock()
+    exchange.order.return_value = RESTING_RESULT
+    mt = MirrorTrader(cfg2, exchange, positions, journal, alerter, market_meta)
+    mt.on_leader_fill("0xleader", outcome_fill)
+    assert len(mt._in_flight) == 1
+    positions.state.set_position_originator.assert_called_once()
