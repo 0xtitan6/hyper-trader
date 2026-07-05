@@ -41,6 +41,12 @@ Launch detached (survives your shell), same pattern as the mirror engine:
 setsid bash -c 'exec .venv/bin/python -m src.maker ... >> state/maker.log 2>&1' </dev/null &
 ```
 
+Then start its watchdog (alerts on process-down / duplicate / stale log):
+```
+setsid bash -c 'exec .venv/bin/python scripts/maker_watchdog.py \
+  --coin "#20" --log state/maker.log --interval 60' </dev/null &
+```
+
 ## 4. Risk knobs (all enforced in `MakerConfig`)
 | Flag / config | Default | Meaning |
 |---|---|---|
@@ -70,5 +76,5 @@ This is a *separate* file from the mirror bot's `./KILL`, so killing one never s
 on the subaccount manually before walking away.
 
 ---
-_Status: maker suite 97 green; subaccount isolation done. Still TODO before unattended
-prod: a liveness/watchdog for the maker process (the mirror's watchdog only covers `src.main`)._
+_Status: maker suite 105 green; subaccount isolation + liveness watchdog done. Paper-trade
+on the subaccount first, then go live small._
