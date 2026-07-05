@@ -1558,8 +1558,12 @@ def test_tick_tfi_cancel_widens_hit_side(mk_cfg, market_meta_mk, journal, monkey
     m._inventory_shares = 5.0  # so ask can quote
     m._inventory_cost = 2.0
     monkeypatch.setattr(_time, "time", lambda: 1_700_000_000.0 + 1)
-    # All-buy tape → TFI = +1 (>= 0.6, < 0.8) → cancel-side, hit = ASK.
-    _drive_tape_buy(m, n=4, sz=3.0)
+    # Mostly-buy tape → TFI ≈ +0.71 (in [tfi_cancel 0.6, tfi_pull 0.8)) → cancel-side,
+    # hit = ASK. (An ALL-buy tape gives TFI=+1.0 ≥ tfi_pull and triggers a full pull —
+    # that path is covered by test_tick_tfi_pull_sets_standdown; here we isolate the
+    # cancel_side band.)
+    _drive_tape_buy(m, n=4, sz=3.0)      # buy vol 12
+    _drive_tape_sell(m, n=1, sz=2.0, base_tid=4)  # sell vol 2 → TFI=(12-2)/(12+2)=0.714
     m.info.post.return_value = _book(0.50, 0.55, bid_sz=50, ask_sz=50)  # QI ~ 0
     m.tick()
     events = _journal_events(journal)
