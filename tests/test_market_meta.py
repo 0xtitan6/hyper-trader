@@ -125,3 +125,82 @@ def test_empty_universe_safe(info):
     mm = MarketMeta(info)
     mm.load()  # should not raise
     assert mm._size_decimals_for("ANYTHING") == 4
+
+
+# --- HIP-3 (builder-deployed) perp dex szDecimals ---------------------------
+
+
+def _info_with_hip3(base_info, *, dexes, meta_by_dex):
+    """Route info.post() so perpDexs / per-dex meta return HIP-3 data."""
+
+    def post(path, payload):
+        t = payload.get("type")
+        if t == "perpDexs":
+            return dexes
+        if t == "meta":
+            return meta_by_dex.get(payload.get("dex"))
+        return None
+
+    base_info.post.side_effect = post
+    return base_info
+
+
+def test_hip3_szdecimals_loaded_from_per_dex_meta(info):
+    # Regression: before the fix, xyz:NVDA/xyz:INTC were absent from the
+    # cache and _size_decimals_for fell back to the perp default of 4, so
+    # round_size produced 4-decimal sizes that HL rejects as "invalid size".
+    _info_with_hip3(
+        info,
+        dexes=[None, {"name": "xyz"}],
+        meta_by_dex={
+            "xyz": {
+                "universe": [
+                    {"name": "xyz:NVDA", "szDecimals": 3},
+                    {"name": "xyz:INTC", "szDecimals": 2},
+                    {"name": "xyz:TSLA", "szDecimals": 3},
+                ]
+            }
+        },
+    )
+    mm = MarketMeta(info)
+    mm.load()
+
+    assert mm._size_decimals_for("xyz:NVDA") == 3
+    assert mm._size_decimals_for("xyz:INTC") == 2
+    assert mm._size_decimals_for("xyz:TSLA") == 3
+
+    # The exact documented failure: 0.12345 must round to 3 dp, not 4.
+    assert mm.round_size("xyz:NVDA", 0.12345) == 0.123
+    assert mm.round_size("xyz:INTC", 0.0806) == 0.08
+
+
+def test_hip3_multiple_dexes_registered(info):
+    _info_with_hip3(
+        info,
+        dexes=[None, {"name": "xyz"}, {"name": "flx"}],
+        meta_by_dex={
+            "xyz": {"universe": [{"name": "xyz:NVDA", "szDecimals": 3}]},
+            "flx": {"universe": [{"name": "flx:OIL", "szDecimals": 1}]},
+        },
+    )
+    mm = MarketMeta(info)
+    mm.load()
+    assert mm._size_decimals_for("xyz:NVDA") == 3
+    assert mm._size_decimals_for("flx:OIL") == 1
+
+
+def test_hip3_fetch_failure_does_not_break_base_load(info):
+    # HIP-3 metadata is best-effort; a failure must not break perp/spot.
+    info.post.side_effect = RuntimeError("perpDexs down")
+    mm = MarketMeta(info)
+    mm.load()  # should not raise
+    assert mm._size_decimals_for("BTC") == 5  # base perp still cached
+    # Unknown HIP-3 coin still falls back to perp default.
+    assert mm._size_decimals_for("xyz:NVDA") == 4
+
+
+def test_hip3_non_list_perpdexs_safe(info):
+    info.post.side_effect = lambda path, payload: {"not": "a list"}
+    mm = MarketMeta(info)
+    mm.load()  # should not raise
+    assert mm._size_decimals_for("BTC") == 5

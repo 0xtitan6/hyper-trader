@@ -35,11 +35,13 @@ class MarketMeta:
                 return
             perp_count = self._load_perp()
             spot_count = self._load_spot()
+            hip3_count = self._load_hip3()
             self._loaded = True
         log.info(
-            "MarketMeta loaded: %d perp markets, %d spot markets cached",
+            "MarketMeta loaded: %d perp markets, %d spot markets, %d HIP-3 markets cached",
             perp_count,
             spot_count,
+            hip3_count,
         )
 
     def _load_perp(self) -> int:
@@ -71,6 +73,56 @@ class MarketMeta:
             base = tokens_by_idx.get(token_idxs[0], {})
             self._sz_decimals[name] = int(base.get("szDecimals", 0))
             n += 1
+        return n
+
+    def _load_hip3(self) -> int:
+        """Fetch szDecimals for every HIP-3 (builder-deployed) perp dex.
+
+        The base `info.meta()` (dex="") returns ONLY the original perp
+        universe, so HIP-3 coins like `xyz:NVDA` are absent and would fall
+        back to the 4-decimal default — which HL rejects as "invalid size"
+        for assets whose true szDecimals is < 4 (xyz:NVDA=3, xyz:INTC=2, ...).
+
+        Per-dex `meta` universe entries carry the fully-qualified name
+        (`xyz:NVDA`), which matches the coin string used as the cache key at
+        every `round_size` call site. Tolerant of failures: HIP-3 metadata is
+        best-effort and must never break startup for base perp/spot markets.
+        """
+        try:
+            dexes = self.info.post("/info", {"type": "perpDexs"}) or []
+        except Exception:
+            log.exception("MarketMeta._load_hip3: perpDexs fetch failed")
+            return 0
+        if not isinstance(dexes, list):
+            log.warning("MarketMeta._load_hip3: perpDexs returned non-list %s", type(dexes))
+            return 0
+
+        n = 0
+        # First entry is the original dex (null) — already covered by _load_perp.
+        for dex_info in dexes[1:]:
+            if not isinstance(dex_info, dict):
+                continue
+            name = dex_info.get("name")
+            if not name:
+                continue
+            try:
+                meta = self.info.post("/info", {"type": "meta", "dex": name})
+            except Exception:
+                log.exception("MarketMeta._load_hip3: meta fetch failed for dex=%s", name)
+                continue
+            if not isinstance(meta, dict):
+                log.warning("MarketMeta._load_hip3: bad meta shape for dex=%s", name)
+                continue
+            for asset in meta.get("universe", []) or []:
+                if not isinstance(asset, dict):
+                    continue
+                coin = asset.get("name")
+                if not coin:
+                    continue
+                self._sz_decimals[coin] = int(
+                    asset.get("szDecimals", _DEFAULT_PERP_SZ_DECIMALS)
+                )
+                n += 1
         return n
 
     def round_size(self, coin: str, sz: float) -> float:
