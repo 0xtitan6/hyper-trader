@@ -263,7 +263,9 @@ def test_reconcile_picks_up_outcome_positions_from_spot(state, journal):
 
 
 def test_reconcile_handles_spot_fetch_failure(state, journal):
-    """If spotClearinghouseState fails, perp reconcile must still work."""
+    """If spotClearinghouseState fails, abort the reconcile and keep local
+    state — we cannot distinguish "settled" from "endpoint down", so we must
+    not mutate/zero anything on a transient spot-fetch error."""
     info = MagicMock()
     info.user_state.return_value = {
         "assetPositions": [{"position": {"coin": "BTC", "szi": "0.1", "entryPx": "50000"}}]
@@ -271,7 +273,35 @@ def test_reconcile_handles_spot_fetch_failure(state, journal):
     info.post.side_effect = RuntimeError("spot endpoint down")
     pt = PositionTracker(info, "0xacc", state, journal)
     result = pt.reconcile_with_user_state()
-    assert result == {"BTC": (0.1, 50000.0)}
+    # Reconcile aborted: no local state existed, so nothing was written.
+    assert result == {}
+
+
+def test_reconcile_spot_fetch_failure_does_not_zero_outcome_positions(state, journal):
+    """REGRESSION: a transient spotClearinghouseState fetch failure must NOT
+    zero a locally-held HIP-4 outcome (#NN) position. Outcome legs live ONLY in
+    spotClearinghouseState.balances; if that POST throws, treating the coin as
+    missing-upstream and zeroing it drops it from exposure, wipes avg_px, and
+    NULLs its originator lock. The reconcile must abort and keep local state."""
+    info = MagicMock()
+    # Seed a live outcome position (as a prior successful reconcile would).
+    state.update_position("#1420", 33.0, 0.31)
+    state.set_position_originator("#1420", "0xleader")
+    assert state.get_positions()["#1420"] == (33.0, 0.31)
+
+    # Perp fetch succeeds, but the spot fetch throws (transient 429/timeout).
+    info.user_state.return_value = {
+        "assetPositions": [{"position": {"coin": "BTC", "szi": "0.1", "entryPx": "50000"}}]
+    }
+    info.post.side_effect = RuntimeError("429 rate limited")
+
+    pt = PositionTracker(info, "0xacc", state, journal)
+    result = pt.reconcile_with_user_state()
+
+    # Outcome position preserved intact: size, avg_px, and originator lock.
+    assert result["#1420"] == (33.0, 0.31)
+    assert state.get_positions()["#1420"] == (33.0, 0.31)
+    assert state.get_position_originator("#1420") == "0xleader"
 
 
 def test_reconcile_skips_non_outcome_spot_balances(state, journal):

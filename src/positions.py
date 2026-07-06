@@ -120,8 +120,18 @@ class PositionTracker:
                 or {}
             )
         except Exception:
-            log.exception("reconcile: spotClearinghouseState fetch failed; perp-only")
-            sc = {}
+            # HIP-4 outcome (`#NN`) positions live ONLY in
+            # spotClearinghouseState.balances, never in assetPositions. If this
+            # fetch fails we cannot tell "position settled" from "endpoint down",
+            # so any locally-held outcome coin would be wrongly treated as
+            # missing-upstream and zeroed below — dropping it from exposure,
+            # wiping avg_px, and NULLing its originator lock. A transient
+            # 429/timeout must NOT corrupt risk state, so abort the reconcile and
+            # keep local state (symmetric with the user_state failure path).
+            log.exception(
+                "reconcile: spotClearinghouseState fetch failed; keeping local state"
+            )
+            return self.state.get_positions()
         for b in sc.get("balances", []) or []:
             if not isinstance(b, dict):
                 continue
