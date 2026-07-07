@@ -116,14 +116,33 @@ def test_bid_suppressed_when_at_position_cap(mk_cfg, market_meta_mk, journal):
     assert m._open.ask_oid is not None
 
 
-def test_bid_suppressed_when_inventory_cost_at_cap(mk_cfg, market_meta_mk, journal):
+def test_bid_suppressed_when_inventory_at_usd_cap(mk_cfg, market_meta_mk, journal):
+    """USD cap is MARK-based (red-team #6): 10 shares * mid 0.525 ≈ $5.25 already
+    exceeds the $5 cap, so the bid is suppressed regardless of cost basis. The
+    ask stays active (we hold shares to sell)."""
     m = _maker(mk_cfg, market_meta_mk, journal)
-    m._inventory_shares = 5.0
-    m._inventory_cost = mk_cfg.max_inventory_usd  # at $ cap
-    m.info.post.return_value = _book(0.50, 0.55)
+    m._inventory_shares = 10.0
+    m._inventory_cost = 0.0  # cheap cost basis — the MARK is what must gate us
+    m.info.post.return_value = _book(0.50, 0.55)  # mid = 0.525
     m.tick()
     assert m._open.bid_oid is None
     assert m._open.ask_oid is not None  # has shares, can still sell
+
+
+def test_bid_cap_uses_mark_not_cost_basis(mk_cfg, market_meta_mk, journal):
+    """Regression for red-team #6: a position bought CHEAP that has since rallied
+    must be marked at the current price for the USD cap, not its low cost basis.
+
+    Hold 9 shares. Cost basis is trivial ($0.90) but the current mark is
+    9 * 0.525 ≈ $4.72; adding a ~$0.52 bid → ~$5.25 > $5 cap → bid suppressed.
+    Under the old cost-basis check ($0.90 + $0.52 = $1.42) the bid would wrongly
+    stay live."""
+    m = _maker(mk_cfg, market_meta_mk, journal)
+    m._inventory_shares = 9.0
+    m._inventory_cost = 0.90  # bought at ~$0.10/share, since rallied to ~0.52
+    bid_px, ask_px = m._compute_quotes(0.525, 0.50, 0.55, sigma_eff=0.0)
+    assert bid_px is None  # mark-based cap suppresses the bid
+    assert ask_px is not None
 
 
 def test_ask_suppressed_when_no_inventory(mk_cfg, market_meta_mk, journal):
@@ -154,9 +173,13 @@ def test_live_calls_exchange_with_post_only(mk_cfg, market_meta_mk, journal):
     m.tick()
     assert m.exchange.order.call_count == 2  # bid + ask
     for call in m.exchange.order.call_args_list:
-        kwargs = call.kwargs
+        args, kwargs = call.args, call.kwargs
         assert kwargs["order_type"] == {"limit": {"tif": "Alo"}}  # post-only
-        assert kwargs["reduce_only"] is False
+        # Long-only maker (red-team #5): the BID (is_buy=True) opens the long so
+        # it is NOT reduce-only; the ASK (is_buy=False) only ever closes, so it
+        # IS reduce-only (can't punch us short if inventory vanishes first).
+        is_buy = args[1]
+        assert kwargs["reduce_only"] is (not is_buy)
 
 
 def test_quotes_dont_cross(mk_cfg, market_meta_mk, journal):
@@ -250,6 +273,33 @@ def test_oversell_clamps_inventory_to_zero(mk_cfg, market_meta_mk, journal):
     assert m._inventory_cost == 0.0
 
 
+# ---------- fill clears the resting oid (red-team #3) ----------
+
+
+def test_buy_fill_clears_bid_oid(mk_cfg, market_meta_mk, journal):
+    """A buy fill consumes our resting BID → its oid must be cleared, else we
+    track a phantom resting order (red-team #3)."""
+    m = _maker(mk_cfg, market_meta_mk, journal)
+    m._open.bid_oid = 555
+    m._open.bid_px = 0.50
+    m.on_own_fill({"sz": "1.0", "px": "0.50", "side": "B"})
+    assert m._open.bid_oid is None
+    assert m._open.bid_px == 0.0
+    assert m._inventory_shares == 1.0
+
+
+def test_sell_fill_clears_ask_oid(mk_cfg, market_meta_mk, journal):
+    """A sell fill consumes our resting ASK → clear its oid (red-team #3)."""
+    m = _maker(mk_cfg, market_meta_mk, journal)
+    m._inventory_shares = 3.0
+    m._inventory_cost = 1.50
+    m._open.ask_oid = 777
+    m._open.ask_px = 0.55
+    m.on_own_fill({"sz": "1.0", "px": "0.55", "side": "A"})
+    assert m._open.ask_oid is None
+    assert m._open.ask_px == 0.0
+
+
 # ---------- cancel + replace ----------
 
 
@@ -286,6 +336,48 @@ def test_cancel_when_mid_moves_above_threshold(mk_cfg, market_meta_mk, journal):
     # Cancel + replace → exchange.cancel called, exchange.order called again
     assert m.exchange.cancel.call_count >= 1
     assert m.exchange.order.call_count > initial_orders
+
+
+def test_suppressed_bid_cancels_stale_resting_order(mk_cfg, market_meta_mk, journal):
+    """Red-team #2: when the inventory cap suppresses the bid, any resting bid
+    from a prior tick must be CANCELLED — the side goes un-quoted, it must not
+    leave an orphaned live order on the book."""
+    m = _maker(mk_cfg, market_meta_mk, journal, dry_run=False)
+    # First: a normal quote establishes a resting bid (flat inventory).
+    m.info.post.return_value = _book(0.50, 0.55)
+    m.tick()
+    assert m._open.bid_oid is not None
+    resting_bid = m._open.bid_oid
+    # Now push inventory to the MARK cap so the bid is suppressed next tick.
+    m._inventory_shares = 10.0  # 10 * 0.525 ≈ $5.25 > $5 cap → bid muted
+    m._inventory_cost = 0.0
+    m.tick()
+    # The stale resting bid was cancelled and the oid cleared.
+    m.exchange.cancel.assert_any_call("#20", resting_bid)
+    assert m._open.bid_oid is None
+    # Ask stays live (we hold shares to sell).
+    assert m._open.ask_oid is not None
+
+
+def test_filled_side_requoted_when_mid_stable(mk_cfg, market_meta_mk, journal):
+    """Red-team #4: a side that filled (oid cleared) must be re-quoted on the
+    next tick even when the mid is stable — no one-sided hang. Previously the
+    mid-stable early-return only checked bid_oid and would skip forever."""
+    m = _maker(mk_cfg, market_meta_mk, journal, dry_run=False)
+    m._inventory_shares = 5.0
+    m._inventory_cost = 2.5
+    m.info.post.return_value = _book(0.50, 0.55)
+    m.tick()  # both sides quoted
+    assert m._open.bid_oid is not None
+    assert m._open.ask_oid is not None
+    # Simulate the ASK filling: sell fill clears ask_oid, keeps some inventory.
+    m.on_own_fill({"sz": "1.0", "px": "0.55", "side": "A"})
+    assert m._open.ask_oid is None
+    orders_before = m.exchange.order.call_count
+    # Same book (mid unchanged) → the ask must still be re-placed.
+    m.tick()
+    assert m._open.ask_oid is not None
+    assert m.exchange.order.call_count > orders_before
 
 
 # ---------- safety ----------
@@ -840,9 +932,52 @@ def test_glft_skew_monotonic_in_inventory(mk_cfg, market_meta_mk, journal):
     assert high > low > 0
 
 
+def _skew_cfg():
+    """cfg for skew-direction tests: high USD cap so the mark-based inventory
+    cap (red-team #6) doesn't suppress the bid when we hold test inventory."""
+    return MakerConfig(
+        coin="#20",
+        expiry_ts=2_000_000_000,
+        quote_size_shares=1.0,
+        min_spread_bps=30.0,
+        max_position_shares=20.0,
+        max_inventory_usd=1_000.0,
+        refresh_interval_s=0.0,
+    )
+
+
+def test_compute_quotes_snapshots_inventory_under_lock(mk_cfg, market_meta_mk, journal):
+    """Red-team #7: _compute_quotes must read inventory under self._lock (a single
+    consistent snapshot) so it can't race the off-thread WS fill handler. Assert
+    the lock is entered during the call."""
+    m = _maker(_skew_cfg(), market_meta_mk, journal)
+    m._inventory_shares = 5.0
+    calls = {"acquire": 0}
+    real_lock = m._lock
+
+    class _CountingLock:
+        def __enter__(self):
+            calls["acquire"] += 1
+            return real_lock.__enter__()
+
+        def __exit__(self, *a):
+            return real_lock.__exit__(*a)
+
+        def acquire(self, *a, **k):
+            calls["acquire"] += 1
+            return real_lock.acquire(*a, **k)
+
+        def release(self):
+            return real_lock.release()
+
+    m._lock = _CountingLock()
+    m._compute_quotes(0.5, 0.50, 0.55, sigma_eff=0.0)
+    assert calls["acquire"] >= 1
+
+
 def test_glft_skew_monotonic_in_sigma(mk_cfg, market_meta_mk, journal):
     """GLFT skew grows with sigma_eff for fixed inventory."""
-    m = _maker(mk_cfg, market_meta_mk, journal)
+    m = _maker(_skew_cfg(), market_meta_mk, journal)
     m._inventory_shares = 10.0
     m._inventory_cost = 0.0
     bid_lo, ask_lo = m._compute_quotes(0.5, 0.50, 0.55, sigma_eff=0.01)
@@ -857,7 +992,7 @@ def test_glft_skew_walks_both_sides_down_when_long(mk_cfg, market_meta_mk, journ
 
     We hold inventory in both cases (so the ask side is active either way) and
     compare sigma_eff=0 (no skew) against sigma_eff>0 (skew on)."""
-    m = _maker(mk_cfg, market_meta_mk, journal)
+    m = _maker(_skew_cfg(), market_meta_mk, journal)
     m._inventory_shares = 10.0
     m._inventory_cost = 0.0
     bid0, ask0 = m._compute_quotes(0.5, 0.50, 0.55, sigma_eff=0.0)
@@ -892,7 +1027,7 @@ def test_use_glft_false_reproduces_legacy_linear_skew(
         quote_size_shares=1.0,
         min_spread_bps=30.0,
         max_position_shares=20.0,
-        max_inventory_usd=5.0,
+        max_inventory_usd=1_000.0,  # high so the mark-based cap (#6) doesn't mute the bid
         refresh_interval_s=0.0,
         use_glft_skew=False,
         inventory_skew_bps_at_full=20.0,
@@ -1271,10 +1406,16 @@ def test_noskew_no_leg_shifts_quotes_up(market_meta_mk, journal):
     """NO leg, YES-prob in band → both quotes shifted UP (buy NO eagerly)."""
     # "#21" is a NO leg; mid=0.95 → p = 1-0.95 = 0.05 (steep band). Hold
     # inventory so the ask side stays active (no-shorts guard otherwise mutes it).
-    off = _maker(_noskew_cfg(coin="#21", noskew_enabled=False), market_meta_mk, journal)
+    # High USD cap: at mid=0.95 holding 5 shares the mark-based cap (#6) would
+    # otherwise suppress the bid ($4.75 held + a new lot > $5), muting b0/b1.
+    off = _maker(
+        _noskew_cfg(coin="#21", noskew_enabled=False, max_inventory_usd=1_000.0),
+        market_meta_mk,
+        journal,
+    )
     off._inventory_shares = 5.0
     b0, a0 = off._compute_quotes(0.95, 0.94, 0.96, sigma_eff=0.0)
-    on = _maker(_noskew_cfg(coin="#21"), market_meta_mk, journal)
+    on = _maker(_noskew_cfg(coin="#21", max_inventory_usd=1_000.0), market_meta_mk, journal)
     on._inventory_shares = 5.0
     b1, a1 = on._compute_quotes(0.95, 0.94, 0.96, sigma_eff=0.0)
     assert b1 > b0
@@ -1425,6 +1566,21 @@ def test_ws_trades_drops_malformed(mk_cfg, market_meta_mk, journal):
     m.handle_ws_trades(_trades_ws([{"tid": 2, "coin": "#20", "side": "B", "sz": "bad", "px": "0.5", "time": 1}]))
     m.handle_ws_trades(_trades_ws([{"tid": 3, "coin": "#20", "side": "B", "sz": "1", "px": "0.5"}]))  # no time
     assert len(m._tape) == 0
+
+
+def test_tape_bounded_when_toxicity_disabled(mk_cfg, market_meta_mk, journal):
+    """Red-team #8: the public trades tape must stay bounded even when toxicity
+    is DISABLED (nothing calls _compute_tfi to prune it). main() still subscribes
+    to the trades feed, so handle_ws_trades keeps appending — the deque maxlen
+    caps it. Push far more prints than the cap and assert it never overflows."""
+    assert mk_cfg.toxicity_enabled is False  # default-off path
+    m = _maker(mk_cfg, market_meta_mk, journal)
+    cap = m._tape.maxlen
+    assert cap is not None
+    # Feed 3x the cap with distinct tids and advancing timestamps.
+    for i in range(cap * 3):
+        m.handle_ws_trades(_trades_ws([_trade(i, "B", 1.0, ts_ms=1_700_000_000_000 + i)]))
+    assert len(m._tape) <= cap
 
 
 def test_seen_trade_tids_disjoint_from_seen_tids(mk_cfg, market_meta_mk, journal):
@@ -1720,3 +1876,187 @@ def test_live_refuses_unauthorized_key():
 def test_live_refuses_shared_kill_file():
     with _pytest.raises(SystemExit):
         _assert_live_account_safety(**_safe_kwargs(kill_file="./KILL", cfg_kill_file="./KILL"))
+
+
+# --- match-gate is wired into main() (red-team #1) ---
+
+
+def test_main_wires_match_gate_into_config(monkeypatch, tmp_path):
+    """Red-team #1: the production main() entrypoint must actually ENABLE the
+    match gate when asked. Drive main() with --match-gate + a fixtures file and
+    assert the MakerConfig handed to OutcomeMaker carries the gate settings.
+
+    Everything network/exchange-facing is stubbed; we capture the config and
+    never run the maker loop or place an order.
+    """
+    import sys
+
+    import src.maker as maker_mod
+
+    fixtures = tmp_path / "fx.json"
+    fixtures.write_text("[]")
+
+    captured = {}
+
+    class _StubMaker:
+        def __init__(self, *, config, **kw):
+            captured["cfg"] = config
+            captured["kw"] = kw
+
+        def run(self):
+            captured["ran"] = True
+
+        def handle_ws_fills(self, msg):
+            pass
+
+        def handle_ws_trades(self, msg):
+            pass
+
+    class _StubInfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, *a, **k):
+            return []
+
+        def subscribe(self, *a, **k):
+            pass
+
+    class _StubExchange:
+        def __init__(self, *a, **k):
+            self.info = _StubInfo()
+
+    class _Ops:
+        log_level = "INFO"
+        log_json = False
+        journal_path = str(tmp_path / "j.jsonl")
+
+    class _Risk:
+        kill_switch_file = "./KILL"
+
+    class _Cfg:
+        ops = _Ops()
+        risk = _Risk()
+        hyperliquid_api_url = "http://x"
+        account_address = "0xMASTER"
+        private_key = "0x" + "1" * 64
+
+    monkeypatch.setattr(maker_mod, "OutcomeMaker", _StubMaker)
+    # main() imports these names locally inside the function; patch at source.
+    import src.config as config_mod
+    import src.hl_outcome as hl_outcome_mod
+    import src.log as log_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda *a, **k: _Cfg())
+    monkeypatch.setattr(log_mod, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(hl_outcome_mod, "register_outcome_assets", lambda *a, **k: None)
+    monkeypatch.setattr(maker_mod.MarketMeta, "load", lambda self: None)
+
+    import hyperliquid.info as hinfo
+    import hyperliquid.exchange as hexch
+    from eth_account import Account
+
+    monkeypatch.setattr(hinfo, "Info", _StubInfo)
+    monkeypatch.setattr(hexch, "Exchange", _StubExchange)
+
+    class _Wallet:
+        address = "0xAGENT"
+
+    monkeypatch.setattr(Account, "from_key", staticmethod(lambda k: _Wallet()))
+
+    argv = [
+        "maker", "--coin", "#20",
+        "--expiry", "2030-01-01T00:00:00+00:00",
+        "--account-address", "0xSUB",
+        "--dry-run",
+        "--match-gate",
+        "--match-gate-fixtures", str(fixtures),
+        "--match-gate-preroll-s", "90",
+        "--match-gate-cooldown-s", "200",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    rc = maker_mod.main()
+    assert rc == 0
+    cfg = captured["cfg"]
+    assert cfg.match_gate_enabled is True
+    assert cfg.match_gate_fixtures_file == str(fixtures)
+    assert cfg.match_gate_preroll_s == 90
+    assert cfg.match_gate_cooldown_s == 200
+
+
+def test_main_match_gate_off_by_default(monkeypatch, tmp_path):
+    """Without --match-gate the config keeps the gate DISABLED (opt-in)."""
+    import sys
+
+    import src.maker as maker_mod
+
+    captured = {}
+
+    class _StubMaker:
+        def __init__(self, *, config, **kw):
+            captured["cfg"] = config
+
+        def run(self):
+            pass
+
+        def handle_ws_fills(self, msg):
+            pass
+
+        def handle_ws_trades(self, msg):
+            pass
+
+    class _StubInfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, *a, **k):
+            return []
+
+        def subscribe(self, *a, **k):
+            pass
+
+    class _StubExchange:
+        def __init__(self, *a, **k):
+            self.info = _StubInfo()
+
+    class _Ops:
+        log_level = "INFO"
+        log_json = False
+        journal_path = str(tmp_path / "j.jsonl")
+
+    class _Risk:
+        kill_switch_file = "./KILL"
+
+    class _Cfg:
+        ops = _Ops()
+        risk = _Risk()
+        hyperliquid_api_url = "http://x"
+        account_address = "0xMASTER"
+        private_key = "0x" + "1" * 64
+
+    import src.config as config_mod
+    import src.hl_outcome as hl_outcome_mod
+    import src.log as log_mod
+    import hyperliquid.info as hinfo
+    import hyperliquid.exchange as hexch
+    from eth_account import Account
+
+    monkeypatch.setattr(maker_mod, "OutcomeMaker", _StubMaker)
+    monkeypatch.setattr(config_mod, "load_config", lambda *a, **k: _Cfg())
+    monkeypatch.setattr(log_mod, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(hl_outcome_mod, "register_outcome_assets", lambda *a, **k: None)
+    monkeypatch.setattr(maker_mod.MarketMeta, "load", lambda self: None)
+    monkeypatch.setattr(hinfo, "Info", _StubInfo)
+    monkeypatch.setattr(hexch, "Exchange", _StubExchange)
+
+    class _Wallet:
+        address = "0xAGENT"
+
+    monkeypatch.setattr(Account, "from_key", staticmethod(lambda k: _Wallet()))
+    monkeypatch.setattr(sys, "argv", [
+        "maker", "--coin", "#20", "--expiry", "2030-01-01T00:00:00+00:00",
+        "--account-address", "0xSUB", "--dry-run",
+    ])
+    assert maker_mod.main() == 0
+    assert captured["cfg"].match_gate_enabled is False

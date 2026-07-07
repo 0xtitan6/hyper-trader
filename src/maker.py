@@ -230,7 +230,15 @@ class OutcomeMaker:
         # unbounded. `_last_book_top` is the prior tick's EXTERNAL (own-stripped)
         # top, used to detect depth evaporation. While `now < _standdown_until`
         # the maker refuses to quote (stand-down after a toxic pull).
-        self._tape: deque[dict[str, Any]] = deque()  # time+count pruned on read
+        # Bound the tape with a hard maxlen so it can NEVER grow unbounded, even
+        # when toxicity is disabled (main() still subscribes to the public trades
+        # feed, so handle_ws_trades keeps appending, but _compute_tfi — the only
+        # place that prunes by time/count — is never called). The cap is set
+        # generously above tfi_window_trades so the read-side window still sees
+        # every relevant print; excess old trades a full window past are dropped
+        # oldest-first by the deque. (red-team #8)
+        _tape_cap = max(1024, config.tfi_window_trades * 4)
+        self._tape: deque[dict[str, Any]] = deque(maxlen=_tape_cap)  # time+count pruned on read
         self._seen_trade_tids: set[int] = set()
         self._last_book_top: dict[str, float] | None = None
         self._standdown_until: float = 0.0
@@ -581,6 +589,13 @@ class OutcomeMaker:
             if side == "B":
                 self._inventory_shares += sz
                 self._inventory_cost += sz * px
+                # A buy fill consumed our resting BID. Clear its oid so we don't
+                # track a phantom resting order (the order that filled is gone
+                # from the book). Leaving it set makes _reconcile's mid-stable
+                # early-return believe a live bid still rests → one-sided hang,
+                # and a stale bid_oid corrupts _strip_own_level. (red-team #3)
+                self._open.bid_oid = None
+                self._open.bid_px = 0.0
             else:
                 # Selling: realize PnL on shares we held. Long-only accounting —
                 # clamp so inventory never goes negative (an oversell can at most
@@ -592,6 +607,9 @@ class OutcomeMaker:
                 )
                 self._inventory_shares = max(0.0, self._inventory_shares - sz)
                 self._inventory_cost = max(0.0, self._inventory_shares * avg)
+                # A sell fill consumed our resting ASK — clear its oid too.
+                self._open.ask_oid = None
+                self._open.ask_px = 0.0
             self._open.fills.append(dict(fill))
         self.journal.write(
             "maker_fill",
@@ -1103,8 +1121,15 @@ class OutcomeMaker:
         with the `quote_offset_ticks` base, the GLFT inventory skew, and the
         NO-skew fair-value shift — none of which are touched.
         """
+        # Snapshot inventory ONCE under the lock. The WS fill handler
+        # (on_own_fill) mutates _inventory_shares/_inventory_cost off-thread
+        # under the same lock; reading them unlocked and multiple times here
+        # races and could mix a pre-fill share count with a post-fill cost. Take
+        # a single consistent snapshot and use the locals below. (red-team #7)
+        with self._lock:
+            inv_shares = self._inventory_shares
         # Normalized inventory q ∈ [0,1] (long-only ⇒ q ≥ 0).
-        q = self._inventory_shares / max(1.0, self.cfg.max_position_shares)
+        q = inv_shares / max(1.0, self.cfg.max_position_shares)
         if self.cfg.use_glft_skew:
             # Vol-aware GLFT skew: walk the whole quote pair DOWN by
             # `q * sigma_eff * c2`. Larger inventory or higher volatility ⇒
@@ -1153,13 +1178,19 @@ class OutcomeMaker:
         bid_active = True
         ask_active = True
 
-        # Don't grow long past position cap
-        if (self._inventory_shares + self.cfg.quote_size_shares > self.cfg.max_position_shares) or (
-            self._inventory_cost + bid_px * self.cfg.quote_size_shares > self.cfg.max_inventory_usd
-        ):
+        # Don't grow long past position cap. The USD cap is a RISK check, so it
+        # must be marked at the CURRENT price, not the historical cost basis: a
+        # position bought cheap that has since rallied carries more risk than its
+        # cost implies, and using cost basis would let us keep adding right as the
+        # mark (and our exposure) climbs. Value the existing inventory at `mid`
+        # and the new lot at its bid price. (red-team #6)
+        projected_usd = inv_shares * mid + bid_px * self.cfg.quote_size_shares
+        if (
+            inv_shares + self.cfg.quote_size_shares > self.cfg.max_position_shares
+        ) or (projected_usd > self.cfg.max_inventory_usd):
             bid_active = False
         # Don't sell what we don't have (no shorts)
-        if self._inventory_shares < self.cfg.quote_size_shares:
+        if inv_shares < self.cfg.quote_size_shares:
             ask_active = False
 
         # Sanity bounds — reject only the side that's outside; the other can quote.
@@ -1185,16 +1216,33 @@ class OutcomeMaker:
     def _reconcile(self, bid_px: float | None, ask_px: float | None, mid: float) -> None:
         """Cancel + replace orders based on new desired quotes."""
         now = time.time()
+        # A side that is SUPPRESSED this tick (target is None — e.g. the
+        # inventory/position cap pulled the bid, or a sanity bound rejected it)
+        # must not keep a stale resting order live. Cancel it immediately, BEFORE
+        # any throttle/mid-stable early-return, so a suppressed side always goes
+        # un-quoted rather than leaving an orphaned resting order on the book.
+        # (red-team #2)
+        if bid_px is None and self._open.bid_oid is not None:
+            self._cancel_one("bid", "bid_suppressed")
+        if ask_px is None and self._open.ask_oid is not None:
+            self._cancel_one("ask", "ask_suppressed")
         # Throttle: don't churn faster than refresh_interval
         if now - self._open.last_quote_at < self.cfg.refresh_interval_s:
             return
-        # If mid moved less than threshold, don't bother replacing
+        # If mid moved less than threshold, don't bother replacing — BUT only
+        # when every side we want to quote already has a resting order. A side
+        # that filled or was cancelled has a None oid; if we skipped here it
+        # would stay un-replaced forever while the other side rests → one-sided
+        # hang. So the mid-stable shortcut is valid only when both desired sides
+        # are already live. (red-team #4)
         moved_bps = (
             abs(mid - self._open.last_mid) / max(self._open.last_mid, 1e-9) * 10_000
             if self._open.last_mid > 0
             else float("inf")
         )
-        if moved_bps < self.cfg.cancel_threshold_bps and self._open.bid_oid:
+        bid_satisfied = bid_px is None or self._open.bid_oid is not None
+        ask_satisfied = ask_px is None or self._open.ask_oid is not None
+        if moved_bps < self.cfg.cancel_threshold_bps and bid_satisfied and ask_satisfied:
             return
 
         # Cancel anything resting
@@ -1235,6 +1283,13 @@ class OutcomeMaker:
                 self._open.ask_oid = -1
                 self._open.ask_px = px
             return
+        # The maker is strictly LONG-ONLY: the bid OPENS the long, the ask only
+        # ever CLOSES it. A resting ask must therefore be reduce-only so that if
+        # inventory is flattened (settlement, manual close, oversell) between the
+        # time we post the ask and the time it fills, the fill can't punch us
+        # into an unintended SHORT — HL rejects/trims a reduce-only order that
+        # would flip the position. The bid stays reduce_only=False. (red-team #5)
+        reduce_only = not is_buy
         try:
             result = self.exchange.order(
                 self.cfg.coin,
@@ -1242,7 +1297,7 @@ class OutcomeMaker:
                 sz_rounded,
                 px,
                 order_type={"limit": {"tif": "Alo"}},  # post-only
-                reduce_only=False,
+                reduce_only=reduce_only,
             )
         except Exception as e:
             self.journal.write(
@@ -1409,6 +1464,21 @@ def main() -> int:
     p.add_argument("--kill-file", default=None,
                    help="Kill-switch file for THIS maker (default: config's kill_switch_file). "
                         "Give the maker its own so it doesn't share the mirror bot's ./KILL.")
+    # Match-event gating (stand down near a live match). OFF by default in the
+    # dataclass, but was never wired into this entrypoint, so production could
+    # never enable it. Expose flags so an operator can turn it on. The gate FAILS
+    # CLOSED: enabling it with no fixtures refuses to quote (see _load_match_windows).
+    p.add_argument("--match-gate", action="store_true",
+                   help="Enable the match-event stand-down gate (refuse to quote inside a "
+                        "fixture window). Requires --match-gate-fixtures unless inline fixtures "
+                        "are configured; fails CLOSED if enabled with no fixtures.")
+    p.add_argument("--match-gate-fixtures", default="",
+                   help="Path to a JSON fixtures calendar for the match gate "
+                        "(list of {match_id, teams, kickoff_ts, est_end_ts}).")
+    p.add_argument("--match-gate-preroll-s", type=int, default=120,
+                   help="Stop quoting this many seconds before kickoff (default 120).")
+    p.add_argument("--match-gate-cooldown-s", type=int, default=300,
+                   help="Resume this many seconds after estimated end (default 300).")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -1454,6 +1524,10 @@ def main() -> int:
         max_position_shares=args.max_position,
         max_inventory_usd=args.max_inventory_usd,
         kill_switch_file=kill_file,
+        match_gate_enabled=args.match_gate,
+        match_gate_fixtures_file=args.match_gate_fixtures,
+        match_gate_preroll_s=args.match_gate_preroll_s,
+        match_gate_cooldown_s=args.match_gate_cooldown_s,
     )
     maker = OutcomeMaker(
         info=info,
