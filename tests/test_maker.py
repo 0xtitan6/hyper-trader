@@ -1678,3 +1678,45 @@ def test_toxicity_disabled_is_fully_inert(mk_cfg, market_meta_mk, journal, monke
     assert m._last_book_top is None
     events = _journal_events(journal)
     assert not any(e["event"] == "maker_toxicity" for e in events)
+
+
+# --- live account-safety gate (red-team 2026-07-07: master-account mislaunch) ---
+import pytest as _pytest
+from src.maker import _assert_live_account_safety
+
+
+def _safe_kwargs(**over):
+    d = dict(dry_run=False, arg_account="0xSUB", cfg_account="0xMASTER",
+             signer_addr="0xAGENT", agent_addrs=["0xagent"], kill_file="./KILL.maker",
+             cfg_kill_file="./KILL")
+    d.update(over)
+    return d
+
+
+def test_live_safety_ok_for_valid_subaccount():
+    _assert_live_account_safety(**_safe_kwargs())  # must not raise
+
+
+def test_dry_run_exempt():
+    _assert_live_account_safety(**_safe_kwargs(dry_run=True, arg_account=None,
+                                               agent_addrs=[], kill_file="./KILL"))
+
+
+def test_live_refuses_missing_account():
+    with _pytest.raises(SystemExit):
+        _assert_live_account_safety(**_safe_kwargs(arg_account=None))
+
+
+def test_live_refuses_master_account():
+    with _pytest.raises(SystemExit):
+        _assert_live_account_safety(**_safe_kwargs(arg_account="0xMASTER"))
+
+
+def test_live_refuses_unauthorized_key():
+    with _pytest.raises(SystemExit):
+        _assert_live_account_safety(**_safe_kwargs(signer_addr="0xWRONGKEY", agent_addrs=["0xagent"]))
+
+
+def test_live_refuses_shared_kill_file():
+    with _pytest.raises(SystemExit):
+        _assert_live_account_safety(**_safe_kwargs(kill_file="./KILL", cfg_kill_file="./KILL"))

@@ -1348,6 +1348,32 @@ class OutcomeMaker:
         return None
 
 
+def _assert_live_account_safety(*, dry_run, arg_account, cfg_account, signer_addr,
+                                agent_addrs, kill_file, cfg_kill_file):
+    """Refuse to place LIVE orders unless the target account, signing key, and kill
+    file are explicitly a SEPARATE subaccount setup. Prevents a mislaunch (omitted
+    --account-address, or the master's env) from trading the mirror bot's account.
+    Dry-run is exempt — it places no orders. Raises SystemExit on any unsafe config."""
+    if dry_run:
+        return
+    if not arg_account:
+        raise SystemExit(
+            "maker LIVE refused: --account-address must be set explicitly "
+            "(no silent fallback to the config/master account).")
+    if cfg_account and arg_account.lower() == cfg_account.lower():
+        raise SystemExit(
+            "maker LIVE refused: --account-address equals the config/master account. "
+            "Trade a SEPARATE subaccount, never the mirror bot's account.")
+    if signer_addr.lower() not in {a.lower() for a in agent_addrs}:
+        raise SystemExit(
+            f"maker LIVE refused: signing key ({signer_addr[:10]}...) is NOT an authorized "
+            f"agent of {arg_account[:10]}.... Wrong key for this account.")
+    if kill_file == cfg_kill_file:
+        raise SystemExit(
+            "maker LIVE refused: --kill-file must differ from the mirror bot's kill "
+            "switch, else killing one affects the other.")
+
+
 def main() -> int:
     """Standalone entrypoint:
 
@@ -1405,6 +1431,18 @@ def main() -> int:
     journal = Journal(cfg.ops.journal_path)
     wallet = Account.from_key(cfg.private_key)
     exchange = Exchange(wallet, cfg.hyperliquid_api_url, account_address=acct)
+
+    # LIVE-safety gate: never trade the master account or with an unauthorized key.
+    _agents = []
+    try:
+        _ea = info.post("/info", {"type": "extraAgents", "user": acct}) or []
+        _agents = [a.get("address", "") for a in _ea if isinstance(a, dict)]
+    except Exception:
+        _agents = []
+    _assert_live_account_safety(
+        dry_run=args.dry_run, arg_account=args.account_address,
+        cfg_account=cfg.account_address, signer_addr=wallet.address,
+        agent_addrs=_agents, kill_file=kill_file, cfg_kill_file=cfg.risk.kill_switch_file)
     register_outcome_assets(exchange.info)
 
     expiry_ts = int(datetime.fromisoformat(args.expiry).timestamp())
